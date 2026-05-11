@@ -1,0 +1,3174 @@
+<!--
+═══════════════════════════════════════════════════════════════════════════
+  ÁTOMO FINANCE — v4
+  Single-file HTML · Supabase + localStorage fallback
+  + Carteiras (multi-wallet por operação)
+  + Transferências internas (recarga de cartão pré-pago)
+  + Custos fixos (recorrentes mensais e parcelados)
+  + Metas mensais por operação
+  + Movimentação entre operações via categoria "Transferência"
+═══════════════════════════════════════════════════════════════════════════
+
+  ┌─ MIGRAÇÃO v3 → v4 ──────────────────────────────────────────────────┐
+  │  Rode SÓ o bloco abaixo se já está na v3.                            │
+  └──────────────────────────────────────────────────────────────────────┘
+
+  ─── MIGRAÇÃO v3 → v4 ────────────────────────────────────────────────
+
+  -- Coluna pra linkar 2 lançamentos de uma transferência entre operações
+  alter table transacoes
+    add column if not exists tx_link_id text;
+
+  ─── SETUP COMPLETO (rode SÓ se nunca rodou nada) ──────────────────────
+
+  create table if not exists categorias (
+    id text primary key,
+    nome text not null,
+    cor text not null default '#908C84',
+    tipo text not null check (tipo in ('entrada', 'saida'))
+  );
+
+  create table if not exists carteiras (
+    id text primary key,
+    nome text not null,
+    operacao text not null,
+    tipo text not null default 'conta' check (tipo in ('conta', 'cartao_prepago')),
+    cor text default '#908C84'
+  );
+
+  create table if not exists transacoes (
+    id text primary key,
+    data date not null,
+    tipo text not null check (tipo in ('entrada', 'saida', 'transferencia')),
+    operacao text not null,
+    valor numeric(14,2) not null,
+    categoria text references categorias(id),
+    carteira text references carteiras(id),
+    carteira_destino text references carteiras(id),
+    descricao text,
+    tx_link_id text,
+    criado_em timestamptz default now()
+  );
+  create index if not exists idx_tx_data on transacoes(data desc);
+  create index if not exists idx_tx_op on transacoes(operacao);
+  create index if not exists idx_tx_link on transacoes(tx_link_id);
+
+  create table if not exists contas (
+    id text primary key,
+    tipo text not null check (tipo in ('pagar', 'receber')),
+    operacao text not null,
+    descricao text not null,
+    valor numeric(14,2) not null,
+    vencimento date not null,
+    status text not null default 'aberta' check (status in ('aberta', 'paga', 'atrasada')),
+    paga_em date,
+    categoria text references categorias(id),
+    carteira text references carteiras(id),
+    recorrencia text default 'unica' check (recorrencia in ('unica', 'mensal', 'parcelada')),
+    dia_vencimento integer,
+    parcela_atual integer,
+    parcela_total integer,
+    conta_origem_id text,
+    ativa boolean default true
+  );
+  create index if not exists idx_contas_venc on contas(vencimento);
+
+  create table if not exists metas (
+    id text primary key,
+    operacao text not null,
+    mes_ano text not null,
+    valor numeric(14,2) not null,
+    criado_em timestamptz default now(),
+    unique(operacao, mes_ano)
+  );
+  create index if not exists idx_metas_mesano on metas(mes_ano);
+
+  alter table categorias disable row level security;
+  alter table carteiras  disable row level security;
+  alter table transacoes disable row level security;
+  alter table contas     disable row level security;
+  alter table metas      disable row level security;
+
+  ═══════════════════════════════════════════════════════════════════════
+-->
+
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Átomo Finance</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,200..900;1,8..60,200..900&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<style>
+  :root {
+    /* Paleta Claude (tema claro) */
+    --bg: #F5F4ED;
+    --surface: #FFFFFF;
+    --surface-alt: #EFEDE4;
+    --surface-warm: #FAF9F2;
+    --border: #E5E2D6;
+    --border-strong: #D4D0BF;
+    --text: #1F1E1B;
+    --text-muted: #6B6862;
+    --text-subtle: #908C84;
+    --accent: #C96442;
+    --accent-hover: #A84F33;
+    --accent-soft: #F4E4DC;
+    --success: #5B7F3F;
+    --success-soft: #E8EFDD;
+    --danger: #A8453A;
+    --danger-soft: #F2DDD9;
+    --shadow-sm: 0 1px 2px rgba(31, 30, 27, 0.04);
+    --shadow-md: 0 2px 8px rgba(31, 30, 27, 0.06);
+    --shadow-lg: 0 8px 32px rgba(31, 30, 27, 0.08);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', system-ui, sans-serif;
+    font-size: 15px;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100vh;
+  }
+
+  /* ───────── Topo ───────── */
+  .header {
+    border-bottom: 1px solid var(--border);
+    background: var(--surface-warm);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    backdrop-filter: blur(8px);
+  }
+  .header-inner {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 18px 32px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 24px;
+  }
+  .brand {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+  }
+  .brand-mark {
+    font-family: 'Source Serif 4', serif;
+    font-size: 22px;
+    font-weight: 500;
+    letter-spacing: -0.02em;
+    color: var(--text);
+  }
+  .brand-mark em {
+    font-style: italic;
+    color: var(--accent);
+    font-weight: 400;
+  }
+  .brand-tag {
+    font-size: 11px;
+    color: var(--text-subtle);
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    font-weight: 500;
+  }
+
+  /* Toggle de visão */
+  .view-toggle {
+    display: flex;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 3px;
+    gap: 2px;
+  }
+  .view-toggle button {
+    background: none;
+    border: none;
+    padding: 7px 16px;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-muted);
+    cursor: pointer;
+    border-radius: 7px;
+    transition: all 0.15s ease;
+    letter-spacing: 0.01em;
+  }
+  .view-toggle button:hover { color: var(--text); }
+  .view-toggle button.active {
+    background: var(--text);
+    color: var(--bg);
+  }
+
+  .sync-indicator {
+    font-size: 11px;
+    color: var(--text-subtle);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .sync-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--success);
+  }
+  .sync-dot.offline { background: var(--text-subtle); }
+  .sync-dot.error { background: var(--danger); }
+
+  /* ───────── Layout ───────── */
+  .main {
+    max-width: 1280px;
+    margin: 0 auto;
+    padding: 40px 32px 80px;
+  }
+
+  /* Tabs */
+  .tabs {
+    display: flex;
+    gap: 4px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 32px;
+    overflow-x: auto;
+  }
+  .tab {
+    background: none;
+    border: none;
+    padding: 12px 20px;
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 500;
+    color: var(--text-muted);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+    transition: all 0.15s;
+    white-space: nowrap;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+
+  /* Page header */
+  .page-header {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    margin-bottom: 28px;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+  .page-title {
+    font-family: 'Source Serif 4', serif;
+    font-weight: 400;
+    font-size: 32px;
+    letter-spacing: -0.02em;
+    line-height: 1.1;
+  }
+  .page-subtitle {
+    color: var(--text-muted);
+    font-size: 14px;
+    margin-top: 6px;
+  }
+
+  /* Botões */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 18px;
+    border-radius: 8px;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: all 0.15s ease;
+    text-decoration: none;
+    white-space: nowrap;
+  }
+  .btn-primary {
+    background: var(--accent);
+    color: white;
+  }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-secondary {
+    background: var(--surface);
+    color: var(--text);
+    border-color: var(--border-strong);
+  }
+  .btn-secondary:hover { background: var(--surface-alt); }
+  .btn-ghost {
+    background: transparent;
+    color: var(--text-muted);
+  }
+  .btn-ghost:hover { background: var(--surface-alt); color: var(--text); }
+  .btn-danger {
+    background: transparent;
+    color: var(--danger);
+    border-color: var(--danger-soft);
+  }
+  .btn-danger:hover { background: var(--danger-soft); }
+
+  /* KPI Cards */
+  .kpi-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 16px;
+    margin-bottom: 32px;
+  }
+  .kpi {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 22px;
+    position: relative;
+    transition: border-color 0.15s;
+  }
+  .kpi:hover { border-color: var(--border-strong); }
+  .kpi-label {
+    font-size: 11px;
+    color: var(--text-subtle);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    font-weight: 600;
+    margin-bottom: 10px;
+  }
+  .kpi-value {
+    font-family: 'Source Serif 4', serif;
+    font-size: 28px;
+    font-weight: 400;
+    letter-spacing: -0.01em;
+  }
+  .kpi-value.positive { color: var(--success); }
+  .kpi-value.negative { color: var(--danger); }
+  .kpi-meta {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-top: 6px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+  .kpi-split {
+    display: flex;
+    gap: 16px;
+    margin-top: 12px;
+    padding-top: 12px;
+    border-top: 1px dashed var(--border);
+  }
+  .kpi-split-item {
+    flex: 1;
+  }
+  .kpi-split-label {
+    font-size: 10px;
+    color: var(--text-subtle);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-weight: 600;
+  }
+  .kpi-split-value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    color: var(--text);
+    margin-top: 2px;
+  }
+
+  /* Cards genéricos */
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px;
+  }
+  .card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 20px;
+  }
+  .card-title {
+    font-family: 'Source Serif 4', serif;
+    font-size: 18px;
+    font-weight: 500;
+    letter-spacing: -0.01em;
+  }
+
+  /* Grid de duas colunas */
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+    margin-bottom: 16px;
+  }
+  @media (max-width: 768px) {
+    .grid-2 { grid-template-columns: 1fr; }
+  }
+
+  /* Tabela */
+  .table-wrap {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    overflow: hidden;
+  }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+  th {
+    text-align: left;
+    padding: 14px 18px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-subtle);
+    font-weight: 600;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface-warm);
+  }
+  td {
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+    font-size: 14px;
+    vertical-align: middle;
+  }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: var(--surface-warm); }
+
+  td.amount {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    text-align: right;
+    font-weight: 500;
+  }
+  td.amount.positive { color: var(--success); }
+  td.amount.negative { color: var(--danger); }
+
+  .empty-state {
+    padding: 60px 20px;
+    text-align: center;
+    color: var(--text-muted);
+  }
+  .empty-state-title {
+    font-family: 'Source Serif 4', serif;
+    font-size: 18px;
+    color: var(--text);
+    margin-bottom: 6px;
+  }
+
+  /* Tags */
+  .tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 9px;
+    border-radius: 5px;
+    font-size: 11px;
+    font-weight: 500;
+    border: 1px solid var(--border);
+    background: var(--surface-warm);
+  }
+  .tag-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--text-subtle);
+  }
+  .tag.op-a { border-color: #D4DBC2; background: #F0F4E5; color: #4A6630; }
+  .tag.op-b { border-color: #C2D6D5; background: #DEEDEC; color: #2C5D5B; }
+  .tag.status-paga { border-color: var(--success-soft); background: var(--success-soft); color: var(--success); }
+  .tag.status-aberta { border-color: var(--border); background: var(--surface-warm); color: var(--text-muted); }
+  .tag.status-atrasada { border-color: var(--danger-soft); background: var(--danger-soft); color: var(--danger); }
+
+  /* Filtros */
+  .filters {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 20px;
+    padding: 14px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+  }
+
+  /* Forms */
+  .form-row {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    flex: 1;
+    min-width: 140px;
+  }
+  label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-subtle);
+    font-weight: 600;
+  }
+  input, select, textarea {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    padding: 9px 12px;
+    font-family: inherit;
+    font-size: 14px;
+    color: var(--text);
+    transition: border-color 0.15s, box-shadow 0.15s;
+    width: 100%;
+  }
+  input:focus, select:focus, textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+
+  /* Modal */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(31, 30, 27, 0.4);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 200;
+    padding: 20px;
+    backdrop-filter: blur(4px);
+  }
+  .modal-backdrop.open { display: flex; }
+  .modal {
+    background: var(--surface);
+    border-radius: 14px;
+    padding: 28px;
+    max-width: 540px;
+    width: 100%;
+    max-height: 90vh;
+    overflow-y: auto;
+    box-shadow: var(--shadow-lg);
+    border: 1px solid var(--border);
+  }
+  .modal-title {
+    font-family: 'Source Serif 4', serif;
+    font-size: 22px;
+    font-weight: 400;
+    letter-spacing: -0.01em;
+    margin-bottom: 6px;
+  }
+  .modal-subtitle {
+    color: var(--text-muted);
+    font-size: 13px;
+    margin-bottom: 24px;
+  }
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 24px;
+    padding-top: 18px;
+    border-top: 1px solid var(--border);
+  }
+
+  /* Chart container */
+  .chart-wrap {
+    position: relative;
+    height: 280px;
+  }
+
+  /* Configurações */
+  .config-section {
+    margin-bottom: 28px;
+  }
+  .config-section-title {
+    font-family: 'Source Serif 4', serif;
+    font-size: 16px;
+    margin-bottom: 12px;
+    color: var(--text);
+  }
+  .config-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px;
+    background: var(--surface-warm);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 8px;
+  }
+  .config-row-info {
+    flex: 1;
+  }
+  .config-row-name {
+    font-weight: 500;
+    font-size: 14px;
+  }
+  .config-row-meta {
+    font-size: 12px;
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', monospace;
+    margin-top: 2px;
+  }
+
+  /* Toast */
+  .toast {
+    position: fixed;
+    bottom: 24px;
+    right: 24px;
+    background: var(--text);
+    color: var(--bg);
+    padding: 12px 20px;
+    border-radius: 10px;
+    font-size: 13px;
+    font-weight: 500;
+    box-shadow: var(--shadow-lg);
+    transform: translateY(100px);
+    opacity: 0;
+    transition: all 0.3s ease;
+    z-index: 300;
+    max-width: 360px;
+  }
+  .toast.show { transform: translateY(0); opacity: 1; }
+  .toast.error { background: var(--danger); }
+  .toast.success { background: var(--success); }
+
+  /* Loading splash */
+  .splash {
+    position: fixed;
+    inset: 0;
+    background: var(--bg);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    transition: opacity 0.3s;
+  }
+  .splash.hidden { opacity: 0; pointer-events: none; }
+  .splash-inner {
+    text-align: center;
+  }
+  .splash-mark {
+    font-family: 'Source Serif 4', serif;
+    font-size: 32px;
+    letter-spacing: -0.02em;
+  }
+  .splash-mark em { color: var(--accent); font-style: italic; }
+  .splash-tag {
+    font-size: 11px;
+    color: var(--text-subtle);
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    margin-top: 8px;
+  }
+
+  @media (max-width: 640px) {
+    .header-inner { padding: 14px 16px; flex-wrap: wrap; }
+    .main { padding: 24px 16px 60px; }
+    .page-title { font-size: 26px; }
+    .view-toggle button { padding: 6px 12px; font-size: 12px; }
+  }
+</style>
+</head>
+<body>
+
+<!-- Splash -->
+<div class="splash" id="splash">
+  <div class="splash-inner">
+    <div class="splash-mark">Átomo <em>Finance</em></div>
+    <div class="splash-tag">carregando</div>
+  </div>
+</div>
+
+<!-- Header -->
+<header class="header">
+  <div class="header-inner">
+    <div class="brand">
+      <div class="brand-mark">Átomo <em>Finance</em></div>
+      <div class="brand-tag" id="brand-tag">v6</div>
+    </div>
+    <div class="view-toggle" id="view-toggle">
+      <button data-view="consolidado" class="active">Consolidado</button>
+      <button data-view="op_a">Bradesco</button>
+      <button data-view="op_b">Conta Simples</button>
+    </div>
+    <div class="sync-indicator" id="sync-indicator">
+      <span class="sync-dot" id="sync-dot"></span>
+      <span id="sync-text">conectando…</span>
+    </div>
+  </div>
+</header>
+
+<main class="main">
+  <!-- Tabs -->
+  <div class="tabs" id="tabs">
+    <button class="tab active" data-tab="dashboard">Dashboard</button>
+    <button class="tab" data-tab="transacoes">Transações</button>
+    <button class="tab" data-tab="contas">Contas a pagar/receber</button>
+    <button class="tab" data-tab="custos-fixos">Custos Fixos</button>
+    <button class="tab" data-tab="metas">Metas</button>
+    <button class="tab" data-tab="categorias">Categorias</button>
+    <button class="tab" data-tab="config">Configurações</button>
+  </div>
+
+  <!-- Conteúdo dinâmico -->
+  <div id="content"></div>
+</main>
+
+<!-- Modal -->
+<div class="modal-backdrop" id="modal-backdrop">
+  <div class="modal" id="modal"></div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+/* ═══════════════════════════════════════════════════════════════════════
+   CONFIG — Supabase
+   ═══════════════════════════════════════════════════════════════════════ */
+const SUPABASE_URL = 'https://supabase.ferramentashub.site';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.ewogICJyb2xlIjogImFub24iLAogICJpc3MiOiAic3VwYWJhc2UiLAogICJpYXQiOiAxNzE1MDUwODAwLAogICJleHAiOiAxODcyODE3MjAwCn0.ErgSZ2IKUZ5azlHCyxafkyVAStjyYsKuftwMxO-JzmY';
+
+const db = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+/* ═══════════════════════════════════════════════════════════════════════
+   ESTADO GLOBAL
+   ═══════════════════════════════════════════════════════════════════════ */
+const state = {
+  view: 'consolidado',     // 'consolidado' | 'op_a' | 'op_b'
+  tab: 'dashboard',
+  dashboardMes: null,      // YYYY-MM, null = mês atual
+  online: false,
+  config: {
+    empresa: 'Átomo',
+    operacoes: [
+      { id: 'op_a', nome: 'Bradesco',      banco: 'Bradesco' },
+      { id: 'op_b', nome: 'Conta Simples', banco: 'Conta Simples' },
+    ],
+  },
+  categorias: [],
+  carteiras: [],
+  transacoes: [],
+  contas: [],
+  metas: [],
+};
+
+const SEED_CATEGORIAS = [
+  // Categorias especiais — transferência entre operações (NÃO contam como receita/despesa real)
+  { id: 'cat_transfer_out', nome: 'Transferência (saída)',  cor: '#908C84', tipo: 'saida',   especial: 'transfer_out' },
+  { id: 'cat_transfer_in',  nome: 'Transferência (entrada)', cor: '#908C84', tipo: 'entrada', especial: 'transfer_in'  },
+  // Categorias normais
+  { id: 'cat_ads',      nome: 'Mídia/Ads',       cor: '#C96442', tipo: 'saida'   },
+  { id: 'cat_salarios', nome: 'Salários',        cor: '#5B7F3F', tipo: 'saida'   },
+  { id: 'cat_saas',     nome: 'SaaS/Software',   cor: '#7A6B4F', tipo: 'saida'   },
+  { id: 'cat_impostos', nome: 'Impostos',        cor: '#A8453A', tipo: 'saida'   },
+  { id: 'cat_pj',       nome: 'Prestadores PJ',  cor: '#5B7B7F', tipo: 'saida'   },
+  { id: 'cat_outros_s', nome: 'Outros (saída)',  cor: '#8B7765', tipo: 'saida'   },
+  { id: 'cat_clientes', nome: 'Receita cliente', cor: '#5B7F3F', tipo: 'entrada' },
+  { id: 'cat_outros_e', nome: 'Outros (entrada)',cor: '#7F9F5B', tipo: 'entrada' },
+];
+
+// IDs fixos das categorias especiais
+const CAT_TRANSFER_OUT = 'cat_transfer_out';
+const CAT_TRANSFER_IN  = 'cat_transfer_in';
+
+const SEED_CARTEIRAS = [
+  { id: 'w_bradesco',   nome: 'Bradesco',        operacao: 'op_a', tipo: 'conta',          cor: '#C96442' },
+  { id: 'w_simples',    nome: 'Conta Simples',   operacao: 'op_b', tipo: 'conta',          cor: '#5B7F3F' },
+  { id: 'w_prepago',    nome: 'Cartão Pré-pago', operacao: 'op_b', tipo: 'cartao_prepago', cor: '#7A6B4F' },
+];
+
+/* ═══════════════════════════════════════════════════════════════════════
+   HELPERS
+   ═══════════════════════════════════════════════════════════════════════ */
+const fmt = {
+  brl: (v) => new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v || 0),
+  num: (v) => new Intl.NumberFormat('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(v || 0),
+  data: (iso) => {
+    if (!iso) return '—';
+    const [y, m, d] = iso.split('-');
+    return `${d}/${m}/${y}`;
+  },
+  mes: (iso) => {
+    if (!iso) return '—';
+    const meses = ['jan','fev','mar','abr','mai','jun','jul','ago','set','out','nov','dez'];
+    const [y, m] = iso.split('-');
+    return `${meses[parseInt(m)-1]}/${y}`;
+  },
+};
+
+const uid = (prefix) => `${prefix}_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+const todayISO = () => new Date().toISOString().slice(0, 10);
+
+function toast(msg, kind = '') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast show ' + kind;
+  setTimeout(() => el.classList.remove('show'), 2800);
+}
+
+function setSyncStatus(status, text) {
+  const dot = document.getElementById('sync-dot');
+  const txt = document.getElementById('sync-text');
+  dot.className = 'sync-dot' + (status === 'online' ? '' : status === 'error' ? ' error' : ' offline');
+  txt.textContent = text;
+}
+
+function getCategoria(id) {
+  return state.categorias.find(c => c.id === id) || { nome: '—', cor: '#908C84' };
+}
+
+// Categorias de transferência entre operações (não contam como receita/despesa real)
+function isTransferCategory(catId) {
+  return catId === CAT_TRANSFER_OUT || catId === CAT_TRANSFER_IN;
+}
+
+// Decide se uma transação deve ser CONSIDERADA pro cálculo de receita/despesa.
+// Regra: transferências entre operações só são ignoradas no CONSOLIDADO.
+// Em visões individuais (op_a ou op_b), aparecem como receita/despesa daquela "empresa".
+function consideraNoCalculo(transacao, visao) {
+  if (!isTransferCategory(transacao.categoria)) return true;
+  return visao !== 'consolidado';
+}
+
+function getOperacao(id) {
+  return state.config.operacoes.find(o => o.id === id) || { nome: '—', banco: '—' };
+}
+
+function getCarteira(id) {
+  return state.carteiras.find(w => w.id === id) || { nome: '—', cor: '#908C84', operacao: '', tipo: 'conta' };
+}
+
+function carteirasDaOperacao(opId) {
+  return state.carteiras.filter(w => w.operacao === opId);
+}
+
+// Saldo de uma carteira específica considerando entradas, saídas e transferências
+function saldoCarteira(carteiraId) {
+  let saldo = 0;
+  state.transacoes.forEach(t => {
+    if (t.tipo === 'entrada' && t.carteira === carteiraId) saldo += +t.valor;
+    if (t.tipo === 'saida'   && t.carteira === carteiraId) saldo -= +t.valor;
+    if (t.tipo === 'transferencia') {
+      if (t.carteira === carteiraId)         saldo -= +t.valor;
+      if (t.carteira_destino === carteiraId) saldo += +t.valor;
+    }
+  });
+  return saldo;
+}
+
+// Saldo total de uma operação (soma das carteiras dela)
+function saldoOperacao(opId) {
+  return carteirasDaOperacao(opId).reduce((s, w) => s + saldoCarteira(w.id), 0);
+}
+
+function filteredTransacoes() {
+  if (state.view === 'consolidado') return state.transacoes;
+  // Inclui transações onde origem OU destino pertencem à operação
+  return state.transacoes.filter(t => {
+    if (t.operacao === state.view) return true;
+    if (t.tipo === 'transferencia') {
+      const wOrig = getCarteira(t.carteira);
+      const wDest = getCarteira(t.carteira_destino);
+      return wOrig.operacao === state.view || wDest.operacao === state.view;
+    }
+    return false;
+  });
+}
+
+function filteredContas() {
+  if (state.view === 'consolidado') return state.contas;
+  return state.contas.filter(c => c.operacao === state.view);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   PERSISTÊNCIA — Supabase + fallback localStorage
+   ═══════════════════════════════════════════════════════════════════════ */
+const LS_KEY = 'atomo_finance_v1';
+
+function saveLocal() {
+  localStorage.setItem(LS_KEY, JSON.stringify({
+    config: state.config,
+    categorias: state.categorias,
+    carteiras: state.carteiras,
+    transacoes: state.transacoes,
+    contas: state.contas,
+    metas: state.metas,
+    savedAt: new Date().toISOString(),
+  }));
+}
+
+function loadLocal() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    if (!raw) return false;
+    const data = JSON.parse(raw);
+    state.config = data.config || state.config;
+    state.categorias = data.categorias || [];
+    state.carteiras = data.carteiras || [];
+    state.transacoes = data.transacoes || [];
+    state.contas = data.contas || [];
+    state.metas = data.metas || [];
+    return true;
+  } catch { return false; }
+}
+
+async function loadFromSupabase() {
+  try {
+    setSyncStatus('connecting', 'sincronizando…');
+    const [cats, wlts, txs, ctas, mts] = await Promise.all([
+      db.from('categorias').select('*').order('nome'),
+      db.from('carteiras').select('*').order('nome'),
+      db.from('transacoes').select('*').order('data', { ascending: false }),
+      db.from('contas').select('*').order('vencimento'),
+      db.from('metas').select('*').order('mes_ano', { ascending: false }),
+    ]);
+
+    if (cats.error) throw cats.error;
+    if (wlts.error) throw wlts.error;
+    if (txs.error)  throw txs.error;
+    if (ctas.error) throw ctas.error;
+    if (mts.error)  throw mts.error;
+
+    state.categorias = cats.data || [];
+    state.carteiras  = wlts.data || [];
+    state.transacoes = txs.data  || [];
+    state.contas     = ctas.data || [];
+    state.metas      = mts.data  || [];
+
+    // Seed inicial de categorias
+    if (state.categorias.length === 0) {
+      await db.from('categorias').insert(SEED_CATEGORIAS);
+      state.categorias = [...SEED_CATEGORIAS];
+    } else {
+      // Garante que categorias especiais de transferência existem (se user já tinha seed antigo)
+      const especiais = SEED_CATEGORIAS.filter(c => c.id === CAT_TRANSFER_OUT || c.id === CAT_TRANSFER_IN);
+      const faltando = especiais.filter(e => !state.categorias.find(c => c.id === e.id));
+      if (faltando.length > 0) {
+        await db.from('categorias').insert(faltando);
+        state.categorias.push(...faltando);
+      }
+    }
+    // Seed inicial de carteiras
+    if (state.carteiras.length === 0) {
+      await db.from('carteiras').insert(SEED_CARTEIRAS);
+      state.carteiras = [...SEED_CARTEIRAS];
+    }
+
+    state.online = true;
+    saveLocal();
+    setSyncStatus('online', 'online');
+    return true;
+  } catch (err) {
+    console.error('[Supabase] Erro ao carregar:', err);
+    state.online = false;
+    setSyncStatus('error', 'offline');
+    return false;
+  }
+}
+
+async function syncInsert(table, row) {
+  if (!state.online) { saveLocal(); return; }
+  try {
+    const { error } = await db.from(table).insert(row);
+    if (error) throw error;
+  } catch (err) {
+    console.error(`[Supabase] insert ${table}:`, err);
+    toast('Erro ao salvar online — guardado local', 'error');
+  }
+  saveLocal();
+}
+
+async function syncUpdate(table, id, patch) {
+  if (!state.online) { saveLocal(); return; }
+  try {
+    const { error } = await db.from(table).update(patch).eq('id', id);
+    if (error) throw error;
+  } catch (err) {
+    console.error(`[Supabase] update ${table}:`, err);
+    toast('Erro ao atualizar online — guardado local', 'error');
+  }
+  saveLocal();
+}
+
+async function syncDelete(table, id) {
+  if (!state.online) { saveLocal(); return; }
+  try {
+    const { error } = await db.from(table).delete().eq('id', id);
+    if (error) throw error;
+  } catch (err) {
+    console.error(`[Supabase] delete ${table}:`, err);
+    toast('Erro ao deletar online — guardado local', 'error');
+  }
+  saveLocal();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   MODAL
+   ═══════════════════════════════════════════════════════════════════════ */
+function openModal(html, onMount) {
+  const backdrop = document.getElementById('modal-backdrop');
+  const modal = document.getElementById('modal');
+  modal.innerHTML = html;
+  backdrop.classList.add('open');
+  if (onMount) onMount(modal);
+}
+function closeModal() {
+  document.getElementById('modal-backdrop').classList.remove('open');
+}
+document.getElementById('modal-backdrop').addEventListener('click', (e) => {
+  if (e.target.id === 'modal-backdrop') closeModal();
+});
+
+function confirmAction(title, message, onConfirm) {
+  openModal(`
+    <div class="modal-title">${title}</div>
+    <div class="modal-subtitle">${message}</div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
+      <button class="btn btn-danger" id="confirm-yes">Confirmar</button>
+    </div>
+  `, (modal) => {
+    modal.querySelector('#confirm-yes').onclick = () => { closeModal(); onConfirm(); };
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   TABS
+   ═══════════════════════════════════════════════════════════════════════ */
+document.getElementById('tabs').addEventListener('click', (e) => {
+  const btn = e.target.closest('.tab');
+  if (!btn) return;
+  state.tab = btn.dataset.tab;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t === btn));
+  render();
+});
+
+document.getElementById('view-toggle').addEventListener('click', (e) => {
+  const btn = e.target.closest('button');
+  if (!btn) return;
+  state.view = btn.dataset.view;
+  document.querySelectorAll('#view-toggle button').forEach(t => t.classList.toggle('active', t === btn));
+  render();
+});
+
+/* ═══════════════════════════════════════════════════════════════════════
+   HELPERS — METAS, FATURAMENTO, RECORRÊNCIA
+   ═══════════════════════════════════════════════════════════════════════ */
+function mesAtual() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+}
+
+function getMeta(operacao, mesAno) {
+  return state.metas.find(m => m.operacao === operacao && m.mes_ano === mesAno);
+}
+
+// Faturamento do mês.
+// - Em visão consolidada: ignora transferências (não infla com PIX entre próprias contas)
+// - Em visão individual: conta transferências como receita real daquela operação
+function faturamentoMes(operacao, mesAno) {
+  return state.transacoes
+    .filter(t => t.tipo === 'entrada' && t.data.startsWith(mesAno) &&
+                 (operacao === 'consolidado' ? !isTransferCategory(t.categoria) : t.operacao === operacao))
+    .reduce((s, t) => s + +t.valor, 0);
+}
+
+// Soma total de custos fixos ativos por mês (projeção)
+function totalCustosFixosMensal(operacao = 'consolidado') {
+  return state.contas
+    .filter(c => c.recorrencia === 'mensal' && c.ativa !== false &&
+                 c.tipo === 'pagar' &&
+                 (operacao === 'consolidado' || c.operacao === operacao))
+    .reduce((s, c) => s + +c.valor, 0)
+    +
+    state.contas
+    .filter(c => c.recorrencia === 'parcelada' && c.status !== 'paga' &&
+                 c.tipo === 'pagar' &&
+                 (operacao === 'consolidado' || c.operacao === operacao))
+    .reduce((s, c) => s + +c.valor, 0);
+}
+
+// Cria a próxima ocorrência de uma conta recorrente
+function gerarProximaConta(contaPaga) {
+  // Mensal infinita: sempre cria a próxima
+  if (contaPaga.recorrencia === 'mensal' && contaPaga.ativa !== false) {
+    const venc = new Date(contaPaga.vencimento + 'T12:00:00');
+    venc.setMonth(venc.getMonth() + 1);
+    const novoVenc = venc.toISOString().slice(0, 10);
+
+    return {
+      id: uid('c'),
+      tipo: contaPaga.tipo,
+      operacao: contaPaga.operacao,
+      descricao: contaPaga.descricao,
+      valor: contaPaga.valor,
+      vencimento: novoVenc,
+      status: 'aberta',
+      paga_em: null,
+      categoria: contaPaga.categoria,
+      carteira: null, // deixa em aberto pra escolher na hora de pagar
+      recorrencia: 'mensal',
+      dia_vencimento: contaPaga.dia_vencimento,
+      parcela_atual: null,
+      parcela_total: null,
+      conta_origem_id: contaPaga.conta_origem_id || contaPaga.id,
+      ativa: true,
+    };
+  }
+
+  // Parcelada: cria próxima se não chegou na última
+  if (contaPaga.recorrencia === 'parcelada' && contaPaga.parcela_atual < contaPaga.parcela_total) {
+    const venc = new Date(contaPaga.vencimento + 'T12:00:00');
+    venc.setMonth(venc.getMonth() + 1);
+    const novoVenc = venc.toISOString().slice(0, 10);
+
+    return {
+      id: uid('c'),
+      tipo: contaPaga.tipo,
+      operacao: contaPaga.operacao,
+      descricao: contaPaga.descricao,
+      valor: contaPaga.valor,
+      vencimento: novoVenc,
+      status: 'aberta',
+      paga_em: null,
+      categoria: contaPaga.categoria,
+      carteira: null,
+      recorrencia: 'parcelada',
+      dia_vencimento: contaPaga.dia_vencimento,
+      parcela_atual: contaPaga.parcela_atual + 1,
+      parcela_total: contaPaga.parcela_total,
+      conta_origem_id: contaPaga.conta_origem_id || contaPaga.id,
+      ativa: true,
+    };
+  }
+
+  return null;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   RENDER ROUTER
+   ═══════════════════════════════════════════════════════════════════════ */
+function render() {
+  const c = document.getElementById('content');
+  if (state.tab === 'dashboard')    c.innerHTML = renderDashboard();
+  if (state.tab === 'transacoes')   c.innerHTML = renderTransacoes();
+  if (state.tab === 'contas')       c.innerHTML = renderContas();
+  if (state.tab === 'custos-fixos') c.innerHTML = renderCustosFixos();
+  if (state.tab === 'metas')        c.innerHTML = renderMetas();
+  if (state.tab === 'categorias')   c.innerHTML = renderCategorias();
+  if (state.tab === 'config')       c.innerHTML = renderConfig();
+
+  // Pós-render hooks
+  if (state.tab === 'dashboard') drawDashboardCharts();
+  attachListeners();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   DASHBOARD
+   ═══════════════════════════════════════════════════════════════════════ */
+function renderDashboard() {
+  const txs = filteredTransacoes();
+  const mesSelecionado = state.dashboardMes || mesAtual();
+  // Filtra transações apenas do mês selecionado (YYYY-MM)
+  const txsMes = txs.filter(t => t.data.startsWith(mesSelecionado));
+
+  // Receita/despesa.
+  // - Consolidado: ignora transferências entre ops (cliente real, fornecedor real)
+  // - Individual: transferências contam como receita/despesa daquela "empresa"
+  const entradasMes = txsMes.filter(t => t.tipo === 'entrada' && consideraNoCalculo(t, state.view))
+                            .reduce((s, t) => s + +t.valor, 0);
+  const saidasMes   = txsMes.filter(t => t.tipo === 'saida'   && consideraNoCalculo(t, state.view))
+                            .reduce((s, t) => s + +t.valor, 0);
+
+  // Saldos por operação e total (HISTÓRICO COMPLETO — não filtra por mês)
+  const saldoOpA = saldoOperacao('op_a');
+  const saldoOpB = saldoOperacao('op_b');
+  const saldoTotal = state.view === 'consolidado' ? saldoOpA + saldoOpB :
+                     state.view === 'op_a' ? saldoOpA : saldoOpB;
+
+  // Contas a pagar/receber filtradas pelo mês selecionado
+  const contasAbertas = filteredContas().filter(c => c.status !== 'paga' && c.vencimento.startsWith(mesSelecionado));
+  const contasAtrasadas = contasAbertas.filter(c => c.vencimento < todayISO());
+
+  // Top categorias do mês selecionado
+  const porCat = {};
+  txsMes.filter(t => t.tipo === 'saida' && consideraNoCalculo(t, state.view)).forEach(t => {
+    porCat[t.categoria] = (porCat[t.categoria] || 0) + +t.valor;
+  });
+  const topCats = Object.entries(porCat).sort((a, b) => b[1] - a[1]).slice(0, 5);
+
+  // Últimas transações do mês selecionado
+  const ultimas = [...txsMes].sort((a,b) => b.data.localeCompare(a.data)).slice(0, 8);
+
+  // Carteiras a exibir
+  const carteirasView = state.view === 'consolidado'
+    ? state.carteiras
+    : carteirasDaOperacao(state.view);
+
+  const viewLabel = state.view === 'consolidado' ? 'Visão consolidada' :
+                    state.view === 'op_a' ? state.config.operacoes[0].nome :
+                    state.config.operacoes[1].nome;
+
+  return `
+    <div class="page-header">
+      <div>
+        <h1 class="page-title">Dashboard</h1>
+        <div class="page-subtitle">${viewLabel} · ${fmt.mes(mesSelecionado + '-01')}</div>
+        <div style="display:flex; align-items:center; gap:8px; margin-top:12px;">
+          <button class="btn btn-ghost" id="dash-mes-prev" style="padding:6px 10px;" title="Mês anterior">←</button>
+          <input type="month" id="dash-mes-input" value="${mesSelecionado}" style="width:auto; padding:7px 10px; font-size:13px;" />
+          <button class="btn btn-ghost" id="dash-mes-next" style="padding:6px 10px;" title="Próximo mês">→</button>
+          ${mesSelecionado !== mesAtual() ? `<button class="btn btn-ghost" id="dash-mes-hoje" style="padding:6px 10px; font-size:12px;">Hoje</button>` : ''}
+        </div>
+      </div>
+      ${carteirasView.some(w => w.tipo === 'cartao_prepago') ? `
+        <button class="btn btn-secondary" id="btn-recarregar">↻ Recarregar cartão</button>
+      ` : ''}
+    </div>
+
+    <div class="kpi-grid">
+      <div class="kpi">
+        <div class="kpi-label">Saldo total</div>
+        <div class="kpi-value ${saldoTotal >= 0 ? 'positive' : 'negative'}">${fmt.brl(saldoTotal)}</div>
+        ${state.view === 'consolidado' ? `
+          <div class="kpi-split">
+            <div class="kpi-split-item">
+              <div class="kpi-split-label">${state.config.operacoes[0].nome}</div>
+              <div class="kpi-split-value">${fmt.brl(saldoOpA)}</div>
+            </div>
+            <div class="kpi-split-item">
+              <div class="kpi-split-label">${state.config.operacoes[1].nome}</div>
+              <div class="kpi-split-value">${fmt.brl(saldoOpB)}</div>
+            </div>
+          </div>
+        ` : carteirasView.length > 1 ? `
+          <div class="kpi-split">
+            ${carteirasView.map(w => `
+              <div class="kpi-split-item">
+                <div class="kpi-split-label">${w.nome}</div>
+                <div class="kpi-split-value">${fmt.brl(saldoCarteira(w.id))}</div>
+              </div>
+            `).join('')}
+          </div>
+        ` : ''}
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Entradas em ${fmt.mes(mesSelecionado + '-01')}</div>
+        <div class="kpi-value positive">${fmt.brl(entradasMes)}</div>
+        <div class="kpi-meta">${txsMes.filter(t => t.tipo === 'entrada').length} transações</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Saídas em ${fmt.mes(mesSelecionado + '-01')}</div>
+        <div class="kpi-value negative">${fmt.brl(saidasMes)}</div>
+        <div class="kpi-meta">${txsMes.filter(t => t.tipo === 'saida').length} transações</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">A pagar/receber em ${fmt.mes(mesSelecionado + '-01')}</div>
+        <div class="kpi-value">${contasAbertas.length}</div>
+        <div class="kpi-meta">${contasAtrasadas.length} atrasada(s)</div>
+      </div>
+    </div>
+
+    ${state.view !== 'consolidado' && carteirasView.length > 1 ? `
+      <div class="card" style="margin-bottom:16px;">
+        <div class="card-header">
+          <div class="card-title">Carteiras</div>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:8px;">
+          ${carteirasView.map(w => {
+            const saldo = saldoCarteira(w.id);
+            const isPrepago = w.tipo === 'cartao_prepago';
+            return `
+              <div class="config-row">
+                <span class="tag-dot" style="background:${w.cor}; width:12px; height:12px;"></span>
+                <div class="config-row-info">
+                  <div class="config-row-name">${w.nome}${isPrepago ? ' <span class="tag" style="font-size:9px; margin-left:6px;">pré-pago</span>' : ''}</div>
+                  <div class="config-row-meta">${state.transacoes.filter(t => t.carteira === w.id || t.carteira_destino === w.id).length} movimentações</div>
+                </div>
+                <div style="font-family:'JetBrains Mono',monospace; font-size:14px; font-weight:500; color:${saldo >= 0 ? 'var(--success)' : 'var(--danger)'};">
+                  ${fmt.brl(saldo)}
+                </div>
+              </div>
+            `;
+          }).join('')}
+        </div>
+      </div>
+    ` : ''}
+
+    ${(() => {
+      // Card de metas no dashboard (mês selecionado)
+      const mes = mesSelecionado;
+      const opsMeta = state.view === 'consolidado'
+        ? state.config.operacoes.filter(o => getMeta(o.id, mes))
+        : state.config.operacoes.filter(o => o.id === state.view && getMeta(o.id, mes));
+      if (opsMeta.length === 0) {
+        return `
+          <div class="card" style="margin-bottom:16px; background:var(--surface-warm);">
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:12px;">
+              <div>
+                <div style="font-family:'Source Serif 4', serif; font-size:16px; margin-bottom:4px;">Sem metas pra ${fmt.mes(mes + '-01')}</div>
+                <div style="font-size:13px; color:var(--text-muted);">Defina uma meta de faturamento mensal pra acompanhar seu progresso aqui.</div>
+              </div>
+              <button class="btn btn-secondary" onclick="document.querySelector('[data-tab=metas]').click();">Definir metas →</button>
+            </div>
+          </div>
+        `;
+      }
+      return `
+        <div class="card" style="margin-bottom:16px;">
+          <div class="card-header">
+            <div class="card-title">Metas de ${fmt.mes(mes + '-01')}</div>
+            <button class="btn btn-ghost" onclick="document.querySelector('[data-tab=metas]').click();">Ver todas →</button>
+          </div>
+          <div style="display:flex; flex-direction:column; gap:12px;">
+            ${opsMeta.map(o => renderMetaProgresso(o.id, mes)).join('')}
+          </div>
+        </div>
+      `;
+    })()}
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">Gastos por categoria · ${fmt.mes(mesSelecionado + '-01')}</div>
+        </div>
+        ${topCats.length === 0
+          ? '<div class="empty-state"><div class="empty-state-title">Sem dados</div>Nenhuma saída no mês.</div>'
+          : '<div class="chart-wrap"><canvas id="chart-categorias"></canvas></div>'}
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">Fluxo do mês · ${fmt.mes(mesSelecionado + '-01')}</div>
+        </div>
+        ${txsMes.filter(t => t.tipo !== 'transferencia').length === 0
+          ? '<div class="empty-state"><div class="empty-state-title">Sem dados</div>Nenhuma transação no mês.</div>'
+          : '<div class="chart-wrap"><canvas id="chart-fluxo"></canvas></div>'}
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px;">
+      <div class="card-header">
+        <div class="card-title">Transações de ${fmt.mes(mesSelecionado + '-01')}</div>
+        <button class="btn btn-ghost" onclick="state.tab='transacoes'; document.querySelector('[data-tab=transacoes]').click();">Ver todas →</button>
+      </div>
+      ${ultimas.length === 0 ? `
+        <div class="empty-state">
+          <div class="empty-state-title">Tudo limpo por aqui</div>
+          Comece registrando uma transação na aba "Transações".
+        </div>
+      ` : `
+        <div class="table-wrap" style="border:none;">
+          <table>
+            <thead>
+              <tr>
+                <th>Data</th>
+                <th>Descrição</th>
+                <th>Categoria</th>
+                <th>Carteira</th>
+                <th style="text-align:right;">Valor</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${ultimas.map(t => renderTxRow(t, true)).join('')}
+            </tbody>
+          </table>
+        </div>
+      `}
+    </div>
+  `;
+}
+
+// Render auxiliar de uma linha de transação (usado em dashboard e tabela completa)
+function renderTxRow(t, compact = false) {
+  const isTransferIntra = t.tipo === 'transferencia'; // recarga de cartão (mesmo escopo)
+  const isTransferInter = isTransferCategory(t.categoria); // entre operações (saída + entrada linkadas)
+
+  const cat = isTransferIntra
+    ? { nome: 'Transferência interna', cor: '#908C84' }
+    : getCategoria(t.categoria);
+  const wOrigem = getCarteira(t.carteira);
+  const wDestino = getCarteira(t.carteira_destino);
+  const valorClass = t.tipo === 'entrada' ? 'positive' : t.tipo === 'saida' ? 'negative' : '';
+  const valorPrefix = t.tipo === 'entrada' ? '+' : t.tipo === 'saida' ? '−' : '↔';
+
+  const carteiraCell = isTransferIntra
+    ? `<span class="tag">${wOrigem.nome} → ${wDestino.nome}</span>`
+    : `<span class="tag"><span class="tag-dot" style="background:${wOrigem.cor}"></span>${wOrigem.nome}</span>`;
+
+  // Indicador sutil de link pra transferências entre operações
+  const linkIcon = isTransferInter ? '<span style="color:var(--text-subtle); font-size:11px; margin-right:4px;" title="Linkada com outra carteira">↔</span>' : '';
+
+  const baseRow = `
+    <td style="font-family:'JetBrains Mono',monospace; font-size:13px; color:var(--text-muted);">${fmt.data(t.data)}</td>
+    <td>${linkIcon}${t.descricao || '—'}</td>
+    <td><span class="tag"><span class="tag-dot" style="background:${cat.cor}"></span>${cat.nome}</span></td>
+    <td>${carteiraCell}</td>
+    <td class="amount ${valorClass}">${valorPrefix} ${fmt.num(t.valor)}</td>
+  `;
+
+  if (compact) return `<tr>${baseRow}</tr>`;
+  return `
+    <tr>
+      ${baseRow}
+      <td style="text-align:right;">
+        <button class="btn btn-ghost" data-edit-tx="${t.id}" style="padding:5px 10px;">Editar</button>
+        <button class="btn btn-ghost" data-del-tx="${t.id}" style="padding:5px 10px; color:var(--danger);">Excluir</button>
+      </td>
+    </tr>
+  `;
+}
+
+let chartCategorias, chartFluxo;
+function drawDashboardCharts() {
+  const txs = filteredTransacoes();
+  const mesSelecionado = state.dashboardMes || mesAtual();
+  const txsMes = txs.filter(t => t.data.startsWith(mesSelecionado));
+
+  // Categoria (exclui transferências entre ops APENAS no consolidado)
+  const porCat = {};
+  txsMes.filter(t => t.tipo === 'saida' && consideraNoCalculo(t, state.view)).forEach(t => {
+    porCat[t.categoria] = (porCat[t.categoria] || 0) + Number(t.valor);
+  });
+  const topCats = Object.entries(porCat).sort((a, b) => b[1] - a[1]).slice(0, 5);
+
+  const canvasCat = document.getElementById('chart-categorias');
+  if (canvasCat && topCats.length) {
+    if (chartCategorias) chartCategorias.destroy();
+    chartCategorias = new Chart(canvasCat, {
+      type: 'doughnut',
+      data: {
+        labels: topCats.map(([id]) => getCategoria(id).nome),
+        datasets: [{
+          data: topCats.map(([, v]) => v),
+          backgroundColor: topCats.map(([id]) => getCategoria(id).cor),
+          borderColor: '#FFFFFF',
+          borderWidth: 2,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: {
+            position: 'right',
+            labels: { font: { family: 'Inter', size: 12 }, color: '#1F1E1B', boxWidth: 10, padding: 12 },
+          },
+          tooltip: {
+            callbacks: { label: (ctx) => `${ctx.label}: ${fmt.brl(ctx.raw)}` },
+          },
+        },
+        cutout: '64%',
+      },
+    });
+  }
+
+  // Fluxo do mês selecionado (todos os dias do mês)
+  const canvasFluxo = document.getElementById('chart-fluxo');
+  const txsFluxo = txsMes.filter(t => t.tipo !== 'transferencia' && consideraNoCalculo(t, state.view));
+  if (canvasFluxo && txsFluxo.length) {
+    // Determina o range de dias do mês selecionado
+    const [ano, mes] = mesSelecionado.split('-').map(Number);
+    const ultimoDia = new Date(ano, mes, 0).getDate(); // último dia do mês
+    const dias = [];
+    const entradasDia = [];
+    const saidasDia = [];
+    for (let d = 1; d <= ultimoDia; d++) {
+      const iso = `${ano}-${String(mes).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+      dias.push(`${String(d).padStart(2,'0')}/${String(mes).padStart(2,'0')}`);
+      entradasDia.push(txsFluxo.filter(t => t.data === iso && t.tipo === 'entrada').reduce((s, t) => s + +t.valor, 0));
+      saidasDia.push(txsFluxo.filter(t => t.data === iso && t.tipo === 'saida').reduce((s, t) => s + +t.valor, 0));
+    }
+
+    if (chartFluxo) chartFluxo.destroy();
+    chartFluxo = new Chart(canvasFluxo, {
+      type: 'line',
+      data: {
+        labels: dias,
+        datasets: [
+          { label: 'Entradas', data: entradasDia, borderColor: '#5B7F3F', backgroundColor: 'rgba(91,127,63,0.08)', fill: true, tension: 0.35, pointRadius: 0 },
+          { label: 'Saídas',   data: saidasDia,   borderColor: '#A8453A', backgroundColor: 'rgba(168,69,58,0.08)', fill: true, tension: 0.35, pointRadius: 0 },
+        ],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { position: 'top', labels: { font: { family: 'Inter', size: 12 }, color: '#1F1E1B', boxWidth: 10, padding: 12 } },
+          tooltip: { callbacks: { label: (ctx) => `${ctx.dataset.label}: ${fmt.brl(ctx.raw)}` } },
+        },
+        scales: {
+          x: { grid: { display: false }, ticks: { color: '#908C84', font: { size: 10 } } },
+          y: { grid: { color: '#E5E2D6' }, ticks: { color: '#908C84', font: { size: 10 }, callback: (v) => `R$ ${v}` } },
+        },
+      },
+    });
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   TRANSAÇÕES
+   ═══════════════════════════════════════════════════════════════════════ */
+let txFilters = { categoria: '', tipo: '', mes: '', carteira: '' };
+
+function renderTransacoes() {
+  let txs = filteredTransacoes();
+  if (txFilters.categoria) txs = txs.filter(t => t.categoria === txFilters.categoria);
+  if (txFilters.tipo)      txs = txs.filter(t => t.tipo === txFilters.tipo);
+  if (txFilters.mes)       txs = txs.filter(t => t.data.startsWith(txFilters.mes));
+  if (txFilters.carteira)  txs = txs.filter(t => t.carteira === txFilters.carteira || t.carteira_destino === txFilters.carteira);
+
+  const carteirasView = state.view === 'consolidado'
+    ? state.carteiras
+    : carteirasDaOperacao(state.view);
+
+  return `
+    <div class="page-header">
+      <div>
+        <h1 class="page-title">Transações</h1>
+        <div class="page-subtitle">${txs.length} registro(s)</div>
+      </div>
+      <div style="display:flex; gap:8px; flex-wrap:wrap;">
+        ${carteirasView.some(w => w.tipo === 'cartao_prepago') ? `
+          <button class="btn btn-secondary" id="btn-recarregar">↻ Recarregar cartão</button>
+        ` : ''}
+        <button class="btn btn-primary" id="btn-nova-tx">+ Nova transação</button>
+      </div>
+    </div>
+
+    <div class="filters">
+      <div class="form-row">
+        <label>Tipo</label>
+        <select id="f-tipo">
+          <option value="">Todos</option>
+          <option value="entrada"       ${txFilters.tipo === 'entrada' ? 'selected' : ''}>Entradas</option>
+          <option value="saida"         ${txFilters.tipo === 'saida' ? 'selected' : ''}>Saídas</option>
+          <option value="transferencia" ${txFilters.tipo === 'transferencia' ? 'selected' : ''}>Transferências</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Carteira</label>
+        <select id="f-carteira">
+          <option value="">Todas</option>
+          ${carteirasView.map(w => `<option value="${w.id}" ${txFilters.carteira === w.id ? 'selected' : ''}>${w.nome}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Categoria</label>
+        <select id="f-cat">
+          <option value="">Todas</option>
+          ${state.categorias.map(c => `<option value="${c.id}" ${txFilters.categoria === c.id ? 'selected' : ''}>${c.nome}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Mês</label>
+        <input type="month" id="f-mes" value="${txFilters.mes}" />
+      </div>
+      <div class="form-row" style="flex:0 0 auto; justify-content:flex-end;">
+        <label>&nbsp;</label>
+        <button class="btn btn-ghost" id="btn-limpar-filtros">Limpar</button>
+      </div>
+    </div>
+
+    ${txs.length === 0 ? `
+      <div class="card">
+        <div class="empty-state">
+          <div class="empty-state-title">Nenhuma transação</div>
+          ${state.transacoes.length === 0 ? 'Clique em "Nova transação" pra começar.' : 'Tente ajustar os filtros.'}
+        </div>
+      </div>
+    ` : `
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Data</th>
+              <th>Descrição</th>
+              <th>Categoria</th>
+              <th>Carteira</th>
+              <th style="text-align:right;">Valor</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody>
+            ${txs.map(t => renderTxRow(t, false)).join('')}
+          </tbody>
+        </table>
+      </div>
+    `}
+  `;
+}
+
+function modalTransacao(tx = null) {
+  const editing = !!tx;
+  const t = tx || { data: todayISO(), tipo: 'saida', operacao: 'op_a', valor: 0, descricao: '', categoria: '', carteira: '' };
+
+  if (!editing && state.view !== 'consolidado') t.operacao = state.view;
+
+  if (t.carteira) {
+    const w = getCarteira(t.carteira);
+    if (w.operacao) t.operacao = w.operacao;
+  }
+
+  // Categorias filtradas por tipo no select dinâmico
+  const renderCatOptions = (tipoAtual) => {
+    return state.categorias
+      .filter(c => c.tipo === tipoAtual || c.tipo === 'entrada' || c.tipo === 'saida')
+      .filter(c => {
+        // Mostra a categoria certa pro tipo:
+        // - Tipo "entrada": permite categorias de entrada + "Transferência (entrada)"
+        // - Tipo "saida": permite categorias de saída + "Transferência (saída)"
+        if (tipoAtual === 'entrada') return c.tipo === 'entrada';
+        return c.tipo === 'saida';
+      })
+      .map(c => `<option value="${c.id}" ${t.categoria === c.id ? 'selected' : ''}>${c.nome}</option>`)
+      .join('');
+  };
+
+  openModal(`
+    <div class="modal-title">${editing ? 'Editar' : 'Nova'} transação</div>
+    <div class="modal-subtitle">${editing ? 'Altere os dados abaixo.' : 'Registre uma entrada ou saída de caixa.'}</div>
+
+    <div class="grid-2">
+      <div class="form-row">
+        <label>Data</label>
+        <input type="date" id="m-data" value="${t.data}" />
+      </div>
+      <div class="form-row">
+        <label>Tipo</label>
+        <select id="m-tipo">
+          <option value="saida"   ${t.tipo === 'saida' ? 'selected' : ''}>Saída</option>
+          <option value="entrada" ${t.tipo === 'entrada' ? 'selected' : ''}>Entrada</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="form-row" style="margin-top:14px;">
+      <label>Carteira (de onde sai / onde entra)</label>
+      <select id="m-carteira">
+        <option value="">— escolha —</option>
+        ${state.carteiras.map(w => `
+          <option value="${w.id}" ${t.carteira === w.id ? 'selected' : ''}>
+            ${w.nome} · ${getOperacao(w.operacao).nome}${w.tipo === 'cartao_prepago' ? ' (pré-pago)' : ''}
+          </option>
+        `).join('')}
+      </select>
+    </div>
+
+    <div class="form-row" style="margin-top:14px;">
+      <label>Valor (R$)</label>
+      <input type="number" id="m-valor" step="0.01" min="0" value="${t.valor}" />
+    </div>
+
+    <div class="form-row" style="margin-top:14px;">
+      <label>Categoria</label>
+      <select id="m-cat">
+        <option value="">— escolha —</option>
+        ${renderCatOptions(t.tipo)}
+      </select>
+    </div>
+
+    <!-- Painel especial — só aparece quando categoria = Transferência -->
+    <div id="m-transfer-panel" style="display:none; background:var(--accent-soft); border:1px solid var(--accent); border-radius:10px; padding:14px; margin-top:14px;">
+      <div style="font-size:12px; color:var(--accent-hover); font-weight:600; text-transform:uppercase; letter-spacing:0.08em; margin-bottom:8px;">
+        ↔ Transferência entre operações
+      </div>
+      <div style="font-size:13px; color:var(--text); margin-bottom:12px; line-height:1.5;">
+        O sistema vai criar <strong>2 lançamentos linkados</strong> (um em cada conta). Saldos individuais mexem normalmente, mas o total consolidado não muda.
+      </div>
+      <div class="form-row">
+        <label>Carteira ${t.tipo === 'saida' ? 'destino (onde entra)' : 'origem (de onde saiu)'}</label>
+        <select id="m-carteira-par">
+          <option value="">— escolha —</option>
+          ${state.carteiras.map(w => `<option value="${w.id}">${w.nome} · ${getOperacao(w.operacao).nome}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+
+    <div class="form-row" style="margin-top:14px;">
+      <label>Descrição</label>
+      <input type="text" id="m-desc" placeholder="Ex: Meta Ads — campanha cliente X" value="${t.descricao || ''}" />
+    </div>
+
+    ${editing && tx.tx_link_id ? `
+      <div style="background:var(--surface-warm); border:1px solid var(--border); border-radius:8px; padding:10px 12px; margin-top:14px; font-size:12px; color:var(--text-muted);">
+        💡 Esta transação está linkada à outra em outra carteira. Editar/excluir afeta as duas.
+      </div>
+    ` : ''}
+
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
+      <button class="btn btn-primary" id="m-salvar">${editing ? 'Salvar alterações' : 'Registrar'}</button>
+    </div>
+  `, (modal) => {
+    const tipoEl = modal.querySelector('#m-tipo');
+    const catEl = modal.querySelector('#m-cat');
+    const transferPanel = modal.querySelector('#m-transfer-panel');
+    const carteiraParLabel = transferPanel.querySelector('label');
+
+    function refreshCategorias() {
+      const tipo = tipoEl.value;
+      catEl.innerHTML = '<option value="">— escolha —</option>' + renderCatOptions(tipo);
+      // Re-checa se a categoria atual é compatível
+      checkTransferPanel();
+    }
+
+    function checkTransferPanel() {
+      const cat = catEl.value;
+      const tipo = tipoEl.value;
+      const isTransfer = isTransferCategory(cat);
+      transferPanel.style.display = isTransfer ? 'block' : 'none';
+      if (isTransfer) {
+        carteiraParLabel.textContent = tipo === 'saida' ? 'Carteira destino (onde entra)' : 'Carteira origem (de onde saiu)';
+      }
+    }
+
+    tipoEl.addEventListener('change', refreshCategorias);
+    catEl.addEventListener('change', checkTransferPanel);
+
+    // Inicializa estado do painel
+    checkTransferPanel();
+
+    // Pré-popula carteira-par se tiver editing
+    if (editing && tx.tx_link_id) {
+      const linked = state.transacoes.find(x => x.id !== tx.id && x.tx_link_id === tx.tx_link_id);
+      if (linked) {
+        const sel = modal.querySelector('#m-carteira-par');
+        if (sel) sel.value = linked.carteira;
+      }
+    }
+
+    modal.querySelector('#m-salvar').onclick = async () => {
+      const data = modal.querySelector('#m-data').value;
+      const tipo = modal.querySelector('#m-tipo').value;
+      const carteira = modal.querySelector('#m-carteira').value;
+      const valor = parseFloat(modal.querySelector('#m-valor').value);
+      const categoria = modal.querySelector('#m-cat').value;
+      const descricao = modal.querySelector('#m-desc').value.trim();
+      const carteiraPar = modal.querySelector('#m-carteira-par')?.value;
+
+      if (!data || !valor || valor <= 0 || !categoria || !carteira) {
+        toast('Preencha data, carteira, valor e categoria', 'error');
+        return;
+      }
+
+      const operacao = getCarteira(carteira).operacao;
+      const isTransfer = isTransferCategory(categoria);
+
+      if (isTransfer) {
+        if (!carteiraPar) {
+          toast('Escolha a carteira do outro lado da transferência', 'error');
+          return;
+        }
+        if (carteiraPar === carteira) {
+          toast('A outra carteira deve ser diferente', 'error');
+          return;
+        }
+        await salvarTransferenciaEntreOps({ editing, tx, data, tipo, carteira, carteiraPar, valor, descricao });
+      } else {
+        await salvarTransacaoSimples({ editing, tx, data, tipo, operacao, carteira, valor, categoria, descricao });
+      }
+
+      closeModal();
+      render();
+    };
+  });
+}
+
+async function salvarTransacaoSimples({ editing, tx, data, tipo, operacao, carteira, valor, categoria, descricao }) {
+  // Se editando uma tx que ANTES era transferência (tx_link_id setado), apaga a linkada
+  if (editing && tx.tx_link_id) {
+    const linkedId = tx.tx_link_id;
+    const linkadas = state.transacoes.filter(x => x.tx_link_id === linkedId && x.id !== tx.id);
+    for (const linked of linkadas) {
+      state.transacoes = state.transacoes.filter(x => x.id !== linked.id);
+      await syncDelete('transacoes', linked.id);
+    }
+  }
+
+  if (editing) {
+    const patch = { data, tipo, operacao, carteira, valor, categoria, descricao, carteira_destino: null, tx_link_id: null };
+    Object.assign(tx, patch);
+    await syncUpdate('transacoes', tx.id, patch);
+    toast('Transação atualizada', 'success');
+  } else {
+    const novo = { id: uid('tx'), data, tipo, operacao, carteira, carteira_destino: null, valor, categoria, descricao, tx_link_id: null };
+    state.transacoes.unshift(novo);
+    await syncInsert('transacoes', novo);
+    toast('Transação registrada', 'success');
+  }
+}
+
+async function salvarTransferenciaEntreOps({ editing, tx, data, tipo, carteira, carteiraPar, valor, descricao }) {
+  // Determina qual lado é qual baseado no tipo escolhido pelo usuário
+  // Tipo "saida" = carteira é origem, carteiraPar é destino
+  // Tipo "entrada" = carteira é destino, carteiraPar é origem
+  const carteiraOrigem  = tipo === 'saida' ? carteira : carteiraPar;
+  const carteiraDestino = tipo === 'saida' ? carteiraPar : carteira;
+
+  // Se editing uma tx linkada existente, faz o update sincronizado
+  if (editing && tx.tx_link_id) {
+    const linkId = tx.tx_link_id;
+    const todas = state.transacoes.filter(x => x.tx_link_id === linkId);
+    // Apaga e recria — mais simples que tentar atualizar in-place
+    for (const t of todas) {
+      state.transacoes = state.transacoes.filter(x => x.id !== t.id);
+      await syncDelete('transacoes', t.id);
+    }
+  } else if (editing && !tx.tx_link_id) {
+    // Era transação simples, virou transferência → apaga a antiga
+    state.transacoes = state.transacoes.filter(x => x.id !== tx.id);
+    await syncDelete('transacoes', tx.id);
+  }
+
+  const linkId = uid('lnk');
+  const txOut = {
+    id: uid('tx'),
+    data,
+    tipo: 'saida',
+    operacao: getCarteira(carteiraOrigem).operacao,
+    carteira: carteiraOrigem,
+    carteira_destino: null,
+    valor,
+    categoria: CAT_TRANSFER_OUT,
+    descricao: descricao || `→ ${getCarteira(carteiraDestino).nome}`,
+    tx_link_id: linkId,
+  };
+  const txIn = {
+    id: uid('tx'),
+    data,
+    tipo: 'entrada',
+    operacao: getCarteira(carteiraDestino).operacao,
+    carteira: carteiraDestino,
+    carteira_destino: null,
+    valor,
+    categoria: CAT_TRANSFER_IN,
+    descricao: descricao || `← ${getCarteira(carteiraOrigem).nome}`,
+    tx_link_id: linkId,
+  };
+  state.transacoes.unshift(txOut, txIn);
+  await syncInsert('transacoes', txOut);
+  await syncInsert('transacoes', txIn);
+  toast(`Transferência registrada: ${getCarteira(carteiraOrigem).nome} → ${getCarteira(carteiraDestino).nome}`, 'success');
+}
+
+// Modal específico pra transferências/recarga de cartão
+function modalTransferencia(presetCarteiraDestino = null) {
+  // Default: pega o pré-pago como destino se não foi passado
+  const destinoDefault = presetCarteiraDestino || state.carteiras.find(w => w.tipo === 'cartao_prepago')?.id || '';
+  const destinoCarteira = getCarteira(destinoDefault);
+  // Origem: outra carteira da mesma operação
+  const origemDefault = state.carteiras.find(w => w.operacao === destinoCarteira.operacao && w.id !== destinoDefault)?.id || '';
+
+  const t = {
+    data: todayISO(),
+    valor: 0,
+    descricao: 'Recarga cartão pré-pago',
+    carteira: origemDefault,
+    carteira_destino: destinoDefault,
+  };
+
+  openModal(`
+    <div class="modal-title">Transferência interna</div>
+    <div class="modal-subtitle">Move dinheiro entre suas carteiras. <strong>Não conta como receita ou despesa.</strong></div>
+
+    <div class="grid-2">
+      <div class="form-row">
+        <label>Data</label>
+        <input type="date" id="m-data" value="${t.data}" />
+      </div>
+      <div class="form-row">
+        <label>Valor (R$)</label>
+        <input type="number" id="m-valor" step="0.01" min="0" value="${t.valor}" />
+      </div>
+    </div>
+
+    <div class="form-row" style="margin-top:14px;">
+      <label>De (origem)</label>
+      <select id="m-origem">
+        ${state.carteiras.map(w => `
+          <option value="${w.id}" ${t.carteira === w.id ? 'selected' : ''}>
+            ${w.nome} · ${fmt.brl(saldoCarteira(w.id))}
+          </option>
+        `).join('')}
+      </select>
+    </div>
+
+    <div class="form-row" style="margin-top:14px;">
+      <label>Para (destino)</label>
+      <select id="m-destino">
+        ${state.carteiras.map(w => `
+          <option value="${w.id}" ${t.carteira_destino === w.id ? 'selected' : ''}>
+            ${w.nome}${w.tipo === 'cartao_prepago' ? ' (pré-pago)' : ''}
+          </option>
+        `).join('')}
+      </select>
+    </div>
+
+    <div class="form-row" style="margin-top:14px;">
+      <label>Descrição</label>
+      <input type="text" id="m-desc" value="${t.descricao}" />
+    </div>
+
+    <div style="background:var(--surface-warm); border:1px solid var(--border); border-radius:8px; padding:12px; margin-top:16px; font-size:12px; color:var(--text-muted);">
+      💡 <strong>Dica:</strong> use isso pra recarregar cartão pré-pago, transferir entre bancos, etc. O dinheiro só muda de carteira — não vira despesa nem receita.
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
+      <button class="btn btn-primary" id="m-salvar">Registrar transferência</button>
+    </div>
+  `, (modal) => {
+    modal.querySelector('#m-salvar').onclick = async () => {
+      const data = modal.querySelector('#m-data').value;
+      const valor = parseFloat(modal.querySelector('#m-valor').value);
+      const origem = modal.querySelector('#m-origem').value;
+      const destino = modal.querySelector('#m-destino').value;
+      const descricao = modal.querySelector('#m-desc').value.trim();
+
+      if (!data || !valor || valor <= 0 || !origem || !destino) {
+        toast('Preencha todos os campos', 'error');
+        return;
+      }
+      if (origem === destino) {
+        toast('Origem e destino devem ser diferentes', 'error');
+        return;
+      }
+
+      const novo = {
+        id: uid('tx'),
+        data,
+        tipo: 'transferencia',
+        operacao: getCarteira(origem).operacao,
+        carteira: origem,
+        carteira_destino: destino,
+        valor,
+        categoria: null,
+        descricao,
+      };
+      state.transacoes.unshift(novo);
+      await syncInsert('transacoes', novo);
+      toast('Transferência registrada', 'success');
+      closeModal();
+      render();
+    };
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   CONTAS A PAGAR/RECEBER
+   ═══════════════════════════════════════════════════════════════════════ */
+function renderContas() {
+  // Atualiza status atrasadas
+  const hoje = todayISO();
+  state.contas.forEach(c => {
+    if (c.status === 'aberta' && c.vencimento < hoje) c.status = 'atrasada';
+  });
+
+  const ctas = filteredContas();
+  const aPagar = ctas.filter(c => c.tipo === 'pagar');
+  const aReceber = ctas.filter(c => c.tipo === 'receber');
+
+  return `
+    <div class="page-header">
+      <div>
+        <h1 class="page-title">Contas a pagar/receber</h1>
+        <div class="page-subtitle">${ctas.length} conta(s)</div>
+      </div>
+      <button class="btn btn-primary" id="btn-nova-conta">+ Nova conta</button>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">A pagar</div>
+          <span class="tag">${aPagar.length}</span>
+        </div>
+        ${renderListaContas(aPagar)}
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">A receber</div>
+          <span class="tag">${aReceber.length}</span>
+        </div>
+        ${renderListaContas(aReceber)}
+      </div>
+    </div>
+  `;
+}
+
+function renderListaContas(lista) {
+  if (lista.length === 0) {
+    return '<div class="empty-state" style="padding:40px 0;">Vazio.</div>';
+  }
+  return `
+    <div style="display:flex; flex-direction:column; gap:8px;">
+      ${lista.map(c => {
+        const recTag = c.recorrencia === 'mensal'
+          ? '<span class="tag" style="font-size:9px;">🔁 mensal</span>'
+          : c.recorrencia === 'parcelada'
+          ? `<span class="tag" style="font-size:9px;">🔁 ${c.parcela_atual}/${c.parcela_total}</span>`
+          : '';
+        return `
+          <div class="config-row">
+            <div class="config-row-info">
+              <div class="config-row-name">${c.descricao} ${recTag}</div>
+              <div class="config-row-meta">
+                ${fmt.brl(c.valor)} · vence ${fmt.data(c.vencimento)} · ${getOperacao(c.operacao).nome}
+              </div>
+            </div>
+            <span class="tag status-${c.status}">${c.status}</span>
+            ${c.status !== 'paga' ? `<button class="btn btn-ghost" data-pagar-conta="${c.id}" style="padding:5px 10px;">Marcar paga</button>` : ''}
+            <button class="btn btn-ghost" data-edit-conta="${c.id}" style="padding:5px 10px;">Editar</button>
+            <button class="btn btn-ghost" data-del-conta="${c.id}" style="padding:5px 10px; color:var(--danger);">×</button>
+          </div>
+        `;
+      }).join('')}
+    </div>
+  `;
+}
+
+function modalConta(conta = null) {
+  const editing = !!conta;
+  const c = conta || {
+    tipo: 'pagar', operacao: 'op_a', descricao: '', valor: 0,
+    vencimento: todayISO(), status: 'aberta', categoria: '', carteira: '',
+    recorrencia: 'unica', dia_vencimento: null, parcela_atual: 1, parcela_total: 12, ativa: true,
+  };
+
+  openModal(`
+    <div class="modal-title">${editing ? 'Editar' : 'Nova'} conta</div>
+    <div class="modal-subtitle">${editing ? 'Altere os dados abaixo.' : 'Registre algo a pagar ou receber.'}</div>
+
+    <div class="grid-2">
+      <div class="form-row">
+        <label>Tipo</label>
+        <select id="m-tipo">
+          <option value="pagar"   ${c.tipo === 'pagar' ? 'selected' : ''}>A pagar</option>
+          <option value="receber" ${c.tipo === 'receber' ? 'selected' : ''}>A receber</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Operação</label>
+        <select id="m-op">
+          ${state.config.operacoes.map(o => `<option value="${o.id}" ${c.operacao === o.id ? 'selected' : ''}>${o.nome}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+
+    <div class="form-row" style="margin-top:14px;">
+      <label>Descrição</label>
+      <input type="text" id="m-desc" placeholder="Ex: Hostinger, Notebook 5/10, etc" value="${c.descricao}" />
+    </div>
+
+    <div class="grid-2" style="margin-top:14px;">
+      <div class="form-row">
+        <label>Valor (R$)</label>
+        <input type="number" id="m-valor" step="0.01" min="0" value="${c.valor}" />
+      </div>
+      <div class="form-row">
+        <label>Vencimento</label>
+        <input type="date" id="m-venc" value="${c.vencimento}" />
+      </div>
+    </div>
+
+    <div class="form-row" style="margin-top:14px;">
+      <label>Recorrência</label>
+      <select id="m-rec">
+        <option value="unica"      ${c.recorrencia === 'unica' ? 'selected' : ''}>Única (não se repete)</option>
+        <option value="mensal"     ${c.recorrencia === 'mensal' ? 'selected' : ''}>Mensal infinita (Hostinger, VPS, etc)</option>
+        <option value="parcelada"  ${c.recorrencia === 'parcelada' ? 'selected' : ''}>Parcelada (X de Y)</option>
+      </select>
+    </div>
+
+    <div id="m-rec-parcelada" style="display:${c.recorrencia === 'parcelada' ? 'block' : 'none'}; margin-top:14px;">
+      <div class="grid-2">
+        <div class="form-row">
+          <label>Parcela atual</label>
+          <input type="number" id="m-pa" min="1" value="${c.parcela_atual || 1}" />
+        </div>
+        <div class="form-row">
+          <label>Total de parcelas</label>
+          <input type="number" id="m-pt" min="1" value="${c.parcela_total || 12}" />
+        </div>
+      </div>
+    </div>
+
+    <div class="grid-2" style="margin-top:14px;">
+      <div class="form-row">
+        <label>Categoria</label>
+        <select id="m-cat">
+          <option value="">— opcional —</option>
+          ${state.categorias.map(cat => `<option value="${cat.id}" ${c.categoria === cat.id ? 'selected' : ''}>${cat.nome}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Carteira (de pagamento)</label>
+        <select id="m-carteira">
+          <option value="">— escolha ao pagar —</option>
+          ${state.carteiras.map(w => `<option value="${w.id}" ${c.carteira === w.id ? 'selected' : ''}>${w.nome}</option>`).join('')}
+        </select>
+      </div>
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
+      <button class="btn btn-primary" id="m-salvar">${editing ? 'Salvar' : 'Registrar'}</button>
+    </div>
+  `, (modal) => {
+    // Toggle de campos de parcela
+    modal.querySelector('#m-rec').addEventListener('change', (e) => {
+      modal.querySelector('#m-rec-parcelada').style.display = e.target.value === 'parcelada' ? 'block' : 'none';
+    });
+
+    modal.querySelector('#m-salvar').onclick = async () => {
+      const tipo = modal.querySelector('#m-tipo').value;
+      const operacao = modal.querySelector('#m-op').value;
+      const descricao = modal.querySelector('#m-desc').value.trim();
+      const valor = parseFloat(modal.querySelector('#m-valor').value);
+      const vencimento = modal.querySelector('#m-venc').value;
+      const categoria = modal.querySelector('#m-cat').value || null;
+      const carteira = modal.querySelector('#m-carteira').value || null;
+      const recorrencia = modal.querySelector('#m-rec').value;
+      const parcela_atual = recorrencia === 'parcelada' ? parseInt(modal.querySelector('#m-pa').value) : null;
+      const parcela_total = recorrencia === 'parcelada' ? parseInt(modal.querySelector('#m-pt').value) : null;
+      const dia_vencimento = recorrencia === 'mensal' ? parseInt(vencimento.slice(8, 10)) : null;
+
+      if (!descricao || !valor || valor <= 0 || !vencimento) {
+        toast('Preencha descrição, valor e vencimento', 'error');
+        return;
+      }
+      if (recorrencia === 'parcelada' && (!parcela_atual || !parcela_total || parcela_atual > parcela_total)) {
+        toast('Verifique parcela atual e total', 'error');
+        return;
+      }
+
+      const dados = {
+        tipo, operacao, descricao, valor, vencimento, categoria, carteira,
+        recorrencia, parcela_atual, parcela_total, dia_vencimento, ativa: true,
+      };
+
+      if (editing) {
+        Object.assign(conta, dados);
+        await syncUpdate('contas', conta.id, dados);
+        toast('Conta atualizada', 'success');
+      } else {
+        const novo = { id: uid('c'), ...dados, status: 'aberta', paga_em: null, conta_origem_id: null };
+        state.contas.push(novo);
+        await syncInsert('contas', novo);
+        toast(recorrencia === 'unica' ? 'Conta registrada' : 'Custo recorrente registrado', 'success');
+      }
+      closeModal();
+      render();
+    };
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   CATEGORIAS
+   ═══════════════════════════════════════════════════════════════════════ */
+/* ═══════════════════════════════════════════════════════════════════════
+   CUSTOS FIXOS
+   ═══════════════════════════════════════════════════════════════════════ */
+function renderCustosFixos() {
+  // Filtra contas a pagar recorrentes
+  let contas = state.contas.filter(c =>
+    c.tipo === 'pagar' &&
+    (c.recorrencia === 'mensal' || c.recorrencia === 'parcelada') &&
+    c.ativa !== false
+  );
+  if (state.view !== 'consolidado') {
+    contas = contas.filter(c => c.operacao === state.view);
+  }
+
+  // Agrupa por origem (mostra apenas a "atual" — última não-paga ou primeira)
+  // Pra simplificar: mostra todas as instâncias agrupadas pela conta_origem_id (ou id próprio se não tem origem)
+  const grupos = {};
+  contas.forEach(c => {
+    const chave = c.conta_origem_id || c.id;
+    if (!grupos[chave]) grupos[chave] = [];
+    grupos[chave].push(c);
+  });
+
+  // Pra cada grupo, pega a primeira aberta (ou a mais recente paga)
+  const linhasFixos = Object.values(grupos).map(grupo => {
+    const aberta = grupo.find(c => c.status !== 'paga');
+    return aberta || grupo.sort((a, b) => b.vencimento.localeCompare(a.vencimento))[0];
+  }).sort((a, b) => a.vencimento.localeCompare(b.vencimento));
+
+  const totalMensal = linhasFixos
+    .filter(c => c.recorrencia === 'mensal')
+    .reduce((s, c) => s + +c.valor, 0);
+  const totalParcelas = linhasFixos
+    .filter(c => c.recorrencia === 'parcelada')
+    .reduce((s, c) => s + +c.valor, 0);
+  const totalGeral = totalMensal + totalParcelas;
+
+  // Status do mês atual: quantas pagas vs em aberto
+  const mesAno = mesAtual();
+  const noMes = state.contas.filter(c =>
+    c.tipo === 'pagar' && c.vencimento.startsWith(mesAno) &&
+    (c.recorrencia === 'mensal' || c.recorrencia === 'parcelada') &&
+    (state.view === 'consolidado' || c.operacao === state.view)
+  );
+  const pagasMes    = noMes.filter(c => c.status === 'paga').length;
+  const pendentesMes = noMes.filter(c => c.status === 'aberta').length;
+  const atrasadasMes = noMes.filter(c => c.status === 'atrasada' || (c.status === 'aberta' && c.vencimento < todayISO())).length;
+
+  const viewLabel = state.view === 'consolidado' ? 'Visão consolidada' :
+                    state.view === 'op_a' ? state.config.operacoes[0].nome :
+                    state.config.operacoes[1].nome;
+
+  return `
+    <div class="page-header">
+      <div>
+        <h1 class="page-title">Custos Fixos</h1>
+        <div class="page-subtitle">${viewLabel} · ${linhasFixos.length} custo(s) recorrente(s)</div>
+      </div>
+      <button class="btn btn-primary" id="btn-novo-fixo">+ Novo custo fixo</button>
+    </div>
+
+    <div class="kpi-grid">
+      <div class="kpi">
+        <div class="kpi-label">Total mensal projetado</div>
+        <div class="kpi-value negative">${fmt.brl(totalGeral)}</div>
+        <div class="kpi-split">
+          <div class="kpi-split-item">
+            <div class="kpi-split-label">Recorrentes</div>
+            <div class="kpi-split-value">${fmt.brl(totalMensal)}</div>
+          </div>
+          <div class="kpi-split-item">
+            <div class="kpi-split-label">Parcelas</div>
+            <div class="kpi-split-value">${fmt.brl(totalParcelas)}</div>
+          </div>
+        </div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Pagas no mês</div>
+        <div class="kpi-value positive">${pagasMes}</div>
+        <div class="kpi-meta">de ${noMes.length} totais</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Pendentes</div>
+        <div class="kpi-value">${pendentesMes}</div>
+        <div class="kpi-meta">aguardando pagamento</div>
+      </div>
+      <div class="kpi">
+        <div class="kpi-label">Atrasadas</div>
+        <div class="kpi-value ${atrasadasMes > 0 ? 'negative' : ''}">${atrasadasMes}</div>
+        <div class="kpi-meta">${atrasadasMes === 0 ? 'tudo em dia 👍' : 'vencidas'}</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Lista de custos recorrentes</div>
+      </div>
+      ${linhasFixos.length === 0 ? `
+        <div class="empty-state">
+          <div class="empty-state-title">Nenhum custo fixo cadastrado</div>
+          Clique em "Novo custo fixo" pra cadastrar Hostinger, VPS, parcelamentos, etc.
+        </div>
+      ` : `
+        <div class="table-wrap" style="border:none;">
+          <table>
+            <thead>
+              <tr>
+                <th>Descrição</th>
+                <th>Tipo</th>
+                <th>Operação</th>
+                <th>Próximo venc.</th>
+                <th>Status</th>
+                <th style="text-align:right;">Valor mensal</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              ${linhasFixos.map(c => {
+                const tipoLabel = c.recorrencia === 'mensal'
+                  ? '🔁 Mensal'
+                  : `🔁 ${c.parcela_atual}/${c.parcela_total}`;
+                return `
+                  <tr>
+                    <td><strong>${c.descricao}</strong></td>
+                    <td><span class="tag" style="font-size:11px;">${tipoLabel}</span></td>
+                    <td>${getOperacao(c.operacao).nome}</td>
+                    <td style="font-family:'JetBrains Mono',monospace; font-size:13px; color:var(--text-muted);">${fmt.data(c.vencimento)}</td>
+                    <td><span class="tag status-${c.status}">${c.status}</span></td>
+                    <td class="amount negative">− ${fmt.num(c.valor)}</td>
+                    <td style="text-align:right;">
+                      ${c.status !== 'paga' ? `<button class="btn btn-ghost" data-pagar-conta="${c.id}" style="padding:5px 10px;">Marcar paga</button>` : ''}
+                      <button class="btn btn-ghost" data-edit-conta="${c.id}" style="padding:5px 10px;">Editar</button>
+                      <button class="btn btn-ghost" data-encerrar-fixo="${c.id}" style="padding:5px 10px; color:var(--danger);" title="Encerrar recorrência">⏹</button>
+                    </td>
+                  </tr>
+                `;
+              }).join('')}
+            </tbody>
+            <tfoot>
+              <tr>
+                <td colspan="5" style="text-align:right; font-weight:500; border-top:2px solid var(--border-strong);">Total mensal:</td>
+                <td class="amount negative" style="border-top:2px solid var(--border-strong); font-size:14px;"><strong>${fmt.brl(totalGeral)}</strong></td>
+                <td style="border-top:2px solid var(--border-strong);"></td>
+              </tr>
+            </tfoot>
+          </table>
+        </div>
+      `}
+    </div>
+
+    <div class="card" style="margin-top:16px;">
+      <div class="card-header"><div class="card-title">Como funciona</div></div>
+      <div style="color:var(--text-muted); font-size:14px; line-height:1.7;">
+        <strong style="color:var(--text);">Mensal infinita</strong> — para contas como Hostinger ou VPS, que se repetem mensalmente sem fim. Quando você marca como paga, o sistema cria automaticamente a do próximo mês.<br>
+        <strong style="color:var(--text);">Parcelada</strong> — para parcelamentos no cartão (ex: notebook em 10x). O sistema cria as próximas parcelas automaticamente até chegar na última.<br>
+        <strong style="color:var(--text);">Encerrar (⏹)</strong> — use quando cancelar um serviço. A conta-mãe é desativada e não gera mais novas ocorrências.
+      </div>
+    </div>
+  `;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   METAS
+   ═══════════════════════════════════════════════════════════════════════ */
+function renderMetas() {
+  const mesAno = mesAtual();
+  const opsParaMostrar = state.view === 'consolidado'
+    ? state.config.operacoes
+    : state.config.operacoes.filter(o => o.id === state.view);
+
+  // Histórico — últimos 6 meses
+  const meses = [];
+  for (let i = 0; i < 6; i++) {
+    const d = new Date();
+    d.setMonth(d.getMonth() - i);
+    meses.push(`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`);
+  }
+
+  return `
+    <div class="page-header">
+      <div>
+        <h1 class="page-title">Metas</h1>
+        <div class="page-subtitle">Faturamento mensal por operação</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px;">
+      <div class="card-header">
+        <div class="card-title">${fmt.mes(mesAno + '-01')} · Mês atual</div>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:14px;">
+        ${opsParaMostrar.map(o => renderMetaProgresso(o.id, mesAno)).join('')}
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">Histórico (últimos 6 meses)</div>
+      </div>
+      <div class="table-wrap" style="border:none;">
+        <table>
+          <thead>
+            <tr>
+              <th>Mês</th>
+              ${state.config.operacoes.map(o => `<th style="text-align:right;">${o.nome}</th>`).join('')}
+              <th style="text-align:right;">Total</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${meses.map(m => {
+              let totalMeta = 0, totalReal = 0;
+              const cells = state.config.operacoes.map(o => {
+                const meta = getMeta(o.id, m);
+                const real = faturamentoMes(o.id, m);
+                totalMeta += meta ? +meta.valor : 0;
+                totalReal += real;
+                const pct = meta && +meta.valor > 0 ? Math.round((real / +meta.valor) * 100) : null;
+                return `
+                  <td style="text-align:right;">
+                    <div style="font-family:'JetBrains Mono',monospace; font-size:13px;">${fmt.brl(real)}</div>
+                    <div style="font-size:11px; color:var(--text-muted);">
+                      ${meta ? `meta ${fmt.brl(+meta.valor)}` : `<button class="btn btn-ghost" data-set-meta="${o.id}|${m}" style="padding:2px 6px; font-size:10px;">+ definir</button>`}
+                      ${pct !== null ? ` · <strong style="color:${pct >= 100 ? 'var(--success)' : pct >= 70 ? 'var(--accent)' : 'var(--danger)'}">${pct}%</strong>` : ''}
+                    </div>
+                  </td>
+                `;
+              }).join('');
+              const pctTotal = totalMeta > 0 ? Math.round((totalReal / totalMeta) * 100) : null;
+              return `
+                <tr>
+                  <td><strong>${fmt.mes(m + '-01')}</strong></td>
+                  ${cells}
+                  <td style="text-align:right;">
+                    <div style="font-family:'JetBrains Mono',monospace; font-size:13px;"><strong>${fmt.brl(totalReal)}</strong></div>
+                    <div style="font-size:11px; color:var(--text-muted);">
+                      ${totalMeta > 0 ? `de ${fmt.brl(totalMeta)}` : '—'}
+                      ${pctTotal !== null ? ` · <strong style="color:${pctTotal >= 100 ? 'var(--success)' : pctTotal >= 70 ? 'var(--accent)' : 'var(--danger)'}">${pctTotal}%</strong>` : ''}
+                    </div>
+                  </td>
+                </tr>
+              `;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function renderMetaProgresso(operacaoId, mesAno) {
+  const op = getOperacao(operacaoId);
+  const meta = getMeta(operacaoId, mesAno);
+  const real = faturamentoMes(operacaoId, mesAno);
+  const valorMeta = meta ? +meta.valor : 0;
+  const pct = valorMeta > 0 ? Math.min(Math.round((real / valorMeta) * 100), 999) : 0;
+  const corBarra = pct >= 100 ? 'var(--success)' : pct >= 70 ? 'var(--accent)' : 'var(--danger)';
+  const faltam = valorMeta - real;
+
+  // Dias restantes no mês
+  const hoje = new Date();
+  const ultimoDia = new Date(hoje.getFullYear(), hoje.getMonth() + 1, 0).getDate();
+  const diasRestantes = ultimoDia - hoje.getDate();
+
+  return `
+    <div style="background:var(--surface-warm); border:1px solid var(--border); border-radius:10px; padding:18px;">
+      <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:12px;">
+        <div>
+          <div style="font-family:'Source Serif 4', serif; font-size:18px; font-weight:500;">${op.nome}</div>
+          <div style="font-size:12px; color:var(--text-muted); margin-top:2px;">
+            ${valorMeta > 0
+              ? `<strong style="color:${corBarra};">${fmt.brl(real)}</strong> de ${fmt.brl(valorMeta)} · <strong>${pct}%</strong>`
+              : 'Sem meta definida pra esse mês'}
+          </div>
+        </div>
+        <button class="btn btn-secondary" data-edit-meta="${operacaoId}|${mesAno}" style="padding:6px 12px; font-size:12px;">
+          ${meta ? 'Editar meta' : '+ Definir meta'}
+        </button>
+      </div>
+      ${valorMeta > 0 ? `
+        <div style="background:var(--surface); border-radius:8px; height:10px; overflow:hidden; border:1px solid var(--border);">
+          <div style="background:${corBarra}; height:100%; width:${Math.min(pct, 100)}%; transition: width 0.4s ease;"></div>
+        </div>
+        <div style="display:flex; justify-content:space-between; margin-top:8px; font-size:11px; color:var(--text-muted); font-family:'JetBrains Mono',monospace;">
+          <span>${faltam > 0 ? `Faltam ${fmt.brl(faltam)}` : `Superou em ${fmt.brl(-faltam)} 🎉`}</span>
+          <span>${diasRestantes} dia(s) restante(s)</span>
+        </div>
+      ` : ''}
+    </div>
+  `;
+}
+
+function modalMeta(operacaoId, mesAno, metaExistente = null) {
+  const op = getOperacao(operacaoId);
+  openModal(`
+    <div class="modal-title">${metaExistente ? 'Editar' : 'Definir'} meta</div>
+    <div class="modal-subtitle">${op.nome} · ${fmt.mes(mesAno + '-01')}</div>
+
+    <div class="form-row" style="margin-top:14px;">
+      <label>Valor da meta (R$)</label>
+      <input type="number" id="m-valor" step="0.01" min="0" value="${metaExistente ? metaExistente.valor : 3000}" />
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
+      ${metaExistente ? '<button class="btn btn-danger" id="m-deletar">Remover</button>' : ''}
+      <button class="btn btn-primary" id="m-salvar">Salvar</button>
+    </div>
+  `, (modal) => {
+    modal.querySelector('#m-salvar').onclick = async () => {
+      const valor = parseFloat(modal.querySelector('#m-valor').value);
+      if (!valor || valor <= 0) { toast('Valor inválido', 'error'); return; }
+
+      if (metaExistente) {
+        const patch = { valor };
+        Object.assign(metaExistente, patch);
+        await syncUpdate('metas', metaExistente.id, patch);
+        toast('Meta atualizada', 'success');
+      } else {
+        const novo = { id: uid('meta'), operacao: operacaoId, mes_ano: mesAno, valor };
+        state.metas.push(novo);
+        await syncInsert('metas', novo);
+        toast('Meta definida', 'success');
+      }
+      closeModal();
+      render();
+    };
+
+    if (metaExistente) {
+      modal.querySelector('#m-deletar').onclick = () => {
+        confirmAction('Remover meta?', `Vai apagar a meta de ${op.nome} pra ${fmt.mes(mesAno + '-01')}.`, async () => {
+          state.metas = state.metas.filter(m => m.id !== metaExistente.id);
+          await syncDelete('metas', metaExistente.id);
+          toast('Meta removida', 'success');
+          closeModal();
+          render();
+        });
+      };
+    }
+  });
+}
+
+function renderCategorias() {
+  const saidas = state.categorias.filter(c => c.tipo === 'saida');
+  const entradas = state.categorias.filter(c => c.tipo === 'entrada');
+
+  return `
+    <div class="page-header">
+      <div>
+        <h1 class="page-title">Categorias</h1>
+        <div class="page-subtitle">Compartilhadas entre as duas operações</div>
+      </div>
+      <button class="btn btn-primary" id="btn-nova-cat">+ Nova categoria</button>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-header"><div class="card-title">Saídas</div></div>
+        ${saidas.length === 0 ? '<div class="empty-state" style="padding:30px 0;">Vazio.</div>' :
+          saidas.map(c => renderCatRow(c)).join('')}
+      </div>
+      <div class="card">
+        <div class="card-header"><div class="card-title">Entradas</div></div>
+        ${entradas.length === 0 ? '<div class="empty-state" style="padding:30px 0;">Vazio.</div>' :
+          entradas.map(c => renderCatRow(c)).join('')}
+      </div>
+    </div>
+  `;
+}
+
+function renderCatRow(c) {
+  const usos = state.transacoes.filter(t => t.categoria === c.id).length;
+  const especial = isTransferCategory(c.id);
+  return `
+    <div class="config-row">
+      <span class="tag-dot" style="background:${c.cor}; width:12px; height:12px;"></span>
+      <div class="config-row-info">
+        <div class="config-row-name">${c.nome} ${especial ? '<span class="tag" style="font-size:9px; margin-left:4px;">sistema</span>' : ''}</div>
+        <div class="config-row-meta">
+          ${usos} transação(ões)${especial ? ' · não conta no P&L' : ''}
+        </div>
+      </div>
+      ${especial ? '' : `<button class="btn btn-ghost" data-edit-cat="${c.id}" style="padding:5px 10px;">Editar</button>`}
+      ${especial ? '' : `<button class="btn btn-ghost" data-del-cat="${c.id}" style="padding:5px 10px; color:var(--danger);">×</button>`}
+    </div>
+  `;
+}
+
+function modalCategoria(cat = null) {
+  const editing = !!cat;
+  const c = cat || { nome: '', cor: '#C96442', tipo: 'saida' };
+
+  openModal(`
+    <div class="modal-title">${editing ? 'Editar' : 'Nova'} categoria</div>
+    <div class="modal-subtitle">${editing ? '' : 'Categorias são compartilhadas entre as operações.'}</div>
+
+    <div class="form-row">
+      <label>Nome</label>
+      <input type="text" id="m-nome" value="${c.nome}" placeholder="Ex: Marketing" />
+    </div>
+
+    <div class="grid-2" style="margin-top:14px;">
+      <div class="form-row">
+        <label>Tipo</label>
+        <select id="m-tipo">
+          <option value="saida"   ${c.tipo === 'saida' ? 'selected' : ''}>Saída</option>
+          <option value="entrada" ${c.tipo === 'entrada' ? 'selected' : ''}>Entrada</option>
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Cor</label>
+        <input type="color" id="m-cor" value="${c.cor}" style="height:38px; padding:4px;" />
+      </div>
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
+      <button class="btn btn-primary" id="m-salvar">${editing ? 'Salvar' : 'Criar'}</button>
+    </div>
+  `, (modal) => {
+    modal.querySelector('#m-salvar').onclick = async () => {
+      const nome = modal.querySelector('#m-nome').value.trim();
+      const cor = modal.querySelector('#m-cor').value;
+      const tipo = modal.querySelector('#m-tipo').value;
+
+      if (!nome) { toast('Nome obrigatório', 'error'); return; }
+
+      if (editing) {
+        const patch = { nome, cor, tipo };
+        Object.assign(cat, patch);
+        await syncUpdate('categorias', cat.id, patch);
+        toast('Categoria atualizada', 'success');
+      } else {
+        const novo = { id: uid('cat'), nome, cor, tipo };
+        state.categorias.push(novo);
+        await syncInsert('categorias', novo);
+        toast('Categoria criada', 'success');
+      }
+      closeModal();
+      render();
+    };
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   CONFIGURAÇÕES
+   ═══════════════════════════════════════════════════════════════════════ */
+function renderConfig() {
+  return `
+    <div class="page-header">
+      <div>
+        <h1 class="page-title">Configurações</h1>
+        <div class="page-subtitle">Empresa, operações, carteiras e dados</div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px;">
+      <div class="config-section">
+        <div class="config-section-title">Empresa</div>
+        <div class="form-row">
+          <label>Nome</label>
+          <input type="text" id="cfg-empresa" value="${state.config.empresa}" />
+        </div>
+      </div>
+
+      <div class="config-section">
+        <div class="config-section-title">Operações</div>
+        ${state.config.operacoes.map((o, i) => `
+          <div class="config-row">
+            <div class="config-row-info">
+              <div class="form-row">
+                <label>Operação ${i+1}</label>
+                <input type="text" data-cfg-op-nome="${o.id}" value="${o.nome}" placeholder="Nome da operação" />
+              </div>
+              <div class="form-row" style="margin-top:8px;">
+                <label>Banco</label>
+                <input type="text" data-cfg-op-banco="${o.id}" value="${o.banco}" placeholder="Banco vinculado" />
+              </div>
+            </div>
+          </div>
+        `).join('')}
+        <button class="btn btn-secondary" id="btn-salvar-config" style="margin-top:12px;">Salvar configurações</button>
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px;">
+      <div class="config-section">
+        <div class="config-section-title">Carteiras</div>
+        <p style="color:var(--text-muted); font-size:13px; margin-bottom:14px;">
+          Cada operação pode ter múltiplas carteiras (conta corrente, cartão pré-pago, etc). Saldos são calculados automaticamente.
+        </p>
+        ${state.config.operacoes.map(o => {
+          const carts = carteirasDaOperacao(o.id);
+          return `
+            <div style="margin-bottom:18px;">
+              <div style="font-size:11px; text-transform:uppercase; letter-spacing:0.08em; color:var(--text-subtle); font-weight:600; margin-bottom:8px;">
+                ${o.nome}
+              </div>
+              ${carts.length === 0 ? '<div style="color:var(--text-muted); font-size:13px; padding:8px;">Nenhuma carteira</div>' :
+                carts.map(w => `
+                  <div class="config-row">
+                    <span class="tag-dot" style="background:${w.cor}; width:12px; height:12px;"></span>
+                    <div class="config-row-info">
+                      <div class="config-row-name">${w.nome} ${w.tipo === 'cartao_prepago' ? '<span class="tag" style="font-size:9px;">pré-pago</span>' : ''}</div>
+                      <div class="config-row-meta">${state.transacoes.filter(t => t.carteira === w.id || t.carteira_destino === w.id).length} movimentações · saldo ${fmt.brl(saldoCarteira(w.id))}</div>
+                    </div>
+                    <button class="btn btn-ghost" data-edit-w="${w.id}" style="padding:5px 10px;">Editar</button>
+                    <button class="btn btn-ghost" data-del-w="${w.id}" style="padding:5px 10px; color:var(--danger);">×</button>
+                  </div>
+                `).join('')
+              }
+              <button class="btn btn-ghost" data-add-w="${o.id}" style="margin-top:6px;">+ Adicionar carteira em ${o.nome}</button>
+            </div>
+          `;
+        }).join('')}
+      </div>
+    </div>
+
+    <div class="card" style="margin-bottom:16px;">
+      <div class="config-section">
+        <div class="config-section-title">Backup</div>
+        <p style="color:var(--text-muted); font-size:13px; margin-bottom:14px;">
+          Exporte um JSON com todos seus dados ou importe de um backup anterior. Importação faz <strong>merge</strong> — não sobrescreve.
+        </p>
+        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+          <button class="btn btn-secondary" id="btn-export">↓ Exportar JSON</button>
+          <button class="btn btn-secondary" id="btn-import">↑ Importar JSON</button>
+          <input type="file" id="file-import" accept=".json" style="display:none;" />
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="config-section">
+        <div class="config-section-title" style="color:var(--danger);">Zona de perigo</div>
+        <p style="color:var(--text-muted); font-size:13px; margin-bottom:14px;">
+          Apaga <strong>tudo</strong> — transações, contas e categorias. Carteiras e configurações da empresa permanecem.
+        </p>
+        <button class="btn btn-danger" id="btn-reset">Resetar todos os dados</button>
+      </div>
+    </div>
+  `;
+}
+
+// Modal de carteira
+function modalCarteira(carteira = null, opPreset = null) {
+  const editing = !!carteira;
+  const w = carteira || { nome: '', operacao: opPreset || 'op_a', tipo: 'conta', cor: '#7A6B4F' };
+
+  openModal(`
+    <div class="modal-title">${editing ? 'Editar' : 'Nova'} carteira</div>
+    <div class="modal-subtitle">Carteiras são contas/cartões dentro de uma operação.</div>
+
+    <div class="form-row">
+      <label>Nome</label>
+      <input type="text" id="m-nome" value="${w.nome}" placeholder="Ex: Cartão Nubank PJ" />
+    </div>
+
+    <div class="grid-2" style="margin-top:14px;">
+      <div class="form-row">
+        <label>Operação</label>
+        <select id="m-op">
+          ${state.config.operacoes.map(o => `<option value="${o.id}" ${w.operacao === o.id ? 'selected' : ''}>${o.nome}</option>`).join('')}
+        </select>
+      </div>
+      <div class="form-row">
+        <label>Tipo</label>
+        <select id="m-tipo">
+          <option value="conta"          ${w.tipo === 'conta' ? 'selected' : ''}>Conta corrente</option>
+          <option value="cartao_prepago" ${w.tipo === 'cartao_prepago' ? 'selected' : ''}>Cartão pré-pago</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="form-row" style="margin-top:14px;">
+      <label>Cor</label>
+      <input type="color" id="m-cor" value="${w.cor}" style="height:38px; padding:4px;" />
+    </div>
+
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
+      <button class="btn btn-primary" id="m-salvar">${editing ? 'Salvar' : 'Criar'}</button>
+    </div>
+  `, (modal) => {
+    modal.querySelector('#m-salvar').onclick = async () => {
+      const nome = modal.querySelector('#m-nome').value.trim();
+      const operacao = modal.querySelector('#m-op').value;
+      const tipo = modal.querySelector('#m-tipo').value;
+      const cor = modal.querySelector('#m-cor').value;
+
+      if (!nome) { toast('Nome obrigatório', 'error'); return; }
+
+      if (editing) {
+        const patch = { nome, operacao, tipo, cor };
+        Object.assign(carteira, patch);
+        await syncUpdate('carteiras', carteira.id, patch);
+        toast('Carteira atualizada', 'success');
+      } else {
+        const novo = { id: uid('w'), nome, operacao, tipo, cor };
+        state.carteiras.push(novo);
+        await syncInsert('carteiras', novo);
+        toast('Carteira criada', 'success');
+      }
+      closeModal();
+      render();
+    };
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   AÇÕES
+   ═══════════════════════════════════════════════════════════════════════ */
+async function pagarConta(c, carteiraId) {
+  const patch = { status: 'paga', paga_em: todayISO(), carteira: carteiraId };
+  Object.assign(c, patch);
+  await syncUpdate('contas', c.id, patch);
+
+  const tx = {
+    id: uid('tx'),
+    data: todayISO(),
+    tipo: c.tipo === 'pagar' ? 'saida' : 'entrada',
+    operacao: c.operacao,
+    carteira: carteiraId,
+    carteira_destino: null,
+    valor: c.valor,
+    categoria: c.categoria || (c.tipo === 'pagar' ? 'cat_outros_s' : 'cat_outros_e'),
+    descricao: `[Conta] ${c.descricao}`,
+  };
+  state.transacoes.unshift(tx);
+  await syncInsert('transacoes', tx);
+
+  // Se for recorrente, gera próxima ocorrência
+  const proxima = gerarProximaConta(c);
+  if (proxima) {
+    state.contas.push(proxima);
+    await syncInsert('contas', proxima);
+    const proxData = fmt.data(proxima.vencimento);
+    if (proxima.recorrencia === 'parcelada') {
+      toast(`Conta paga · Parcela ${proxima.parcela_atual}/${proxima.parcela_total} criada pra ${proxData}`, 'success');
+    } else {
+      toast(`Conta paga · Próxima criada pra ${proxData}`, 'success');
+    }
+  } else {
+    if (c.recorrencia === 'parcelada' && c.parcela_atual === c.parcela_total) {
+      toast(`Última parcela paga! 🎉 (${c.parcela_total}/${c.parcela_total})`, 'success');
+    } else {
+      toast('Conta paga + transação registrada', 'success');
+    }
+  }
+  render();
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   LISTENERS
+   ═══════════════════════════════════════════════════════════════════════ */
+function attachListeners() {
+  // Seletor de mês no Dashboard
+  document.getElementById('dash-mes-input')?.addEventListener('change', (e) => {
+    if (e.target.value) {
+      state.dashboardMes = e.target.value;
+      render();
+    }
+  });
+  document.getElementById('dash-mes-prev')?.addEventListener('click', () => {
+    const [ano, mes] = (state.dashboardMes || mesAtual()).split('-').map(Number);
+    const d = new Date(ano, mes - 2, 1); // mes-1 (porque mes é 1-based, Date é 0-based) - 1 = mes-2
+    state.dashboardMes = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+    render();
+  });
+  document.getElementById('dash-mes-next')?.addEventListener('click', () => {
+    const [ano, mes] = (state.dashboardMes || mesAtual()).split('-').map(Number);
+    const d = new Date(ano, mes, 1); // mes-1 + 1 = mes
+    state.dashboardMes = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}`;
+    render();
+  });
+  document.getElementById('dash-mes-hoje')?.addEventListener('click', () => {
+    state.dashboardMes = mesAtual();
+    render();
+  });
+
+  // Botão recarregar cartão (aparece em dashboard e transações)
+  document.getElementById('btn-recarregar')?.addEventListener('click', () => modalTransferencia());
+
+  // Transações
+  document.getElementById('btn-nova-tx')?.addEventListener('click', () => modalTransacao());
+  document.querySelectorAll('[data-edit-tx]').forEach(b => b.onclick = () => {
+    const tx = state.transacoes.find(t => t.id === b.dataset.editTx);
+    if (tx.tipo === 'transferencia') {
+      toast('Transferências não podem ser editadas — exclua e recrie', 'error');
+      return;
+    }
+    modalTransacao(tx);
+  });
+  document.querySelectorAll('[data-del-tx]').forEach(b => b.onclick = () => {
+    const id = b.dataset.delTx;
+    const tx = state.transacoes.find(t => t.id === id);
+    const linkId = tx?.tx_link_id;
+    const isLinked = !!linkId;
+
+    confirmAction(
+      isLinked ? 'Excluir transferência?' : 'Excluir transação?',
+      isLinked
+        ? 'Os 2 lançamentos linkados (saída + entrada) serão excluídos juntos. Esta ação não pode ser desfeita.'
+        : 'Esta ação não pode ser desfeita.',
+      async () => {
+        if (isLinked) {
+          // Apaga os 2 lados
+          const linkadas = state.transacoes.filter(t => t.tx_link_id === linkId);
+          for (const t of linkadas) {
+            state.transacoes = state.transacoes.filter(x => x.id !== t.id);
+            await syncDelete('transacoes', t.id);
+          }
+          toast('Transferência excluída (2 lançamentos)');
+        } else {
+          state.transacoes = state.transacoes.filter(t => t.id !== id);
+          await syncDelete('transacoes', id);
+          toast('Transação excluída');
+        }
+        render();
+      }
+    );
+  });
+
+  // Filtros tx
+  document.getElementById('f-tipo')?.addEventListener('change', (e) => { txFilters.tipo = e.target.value; render(); });
+  document.getElementById('f-cat')?.addEventListener('change', (e) => { txFilters.categoria = e.target.value; render(); });
+  document.getElementById('f-mes')?.addEventListener('change', (e) => { txFilters.mes = e.target.value; render(); });
+  document.getElementById('f-carteira')?.addEventListener('change', (e) => { txFilters.carteira = e.target.value; render(); });
+  document.getElementById('btn-limpar-filtros')?.addEventListener('click', () => { txFilters = { categoria: '', tipo: '', mes: '', carteira: '' }; render(); });
+
+  // Contas
+  document.getElementById('btn-nova-conta')?.addEventListener('click', () => modalConta());
+  document.getElementById('btn-novo-fixo')?.addEventListener('click', () => {
+    modalConta();
+    // Pré-seleciona "mensal" no select de recorrência após o modal abrir
+    setTimeout(() => {
+      const sel = document.querySelector('#m-rec');
+      if (sel) {
+        sel.value = 'mensal';
+        sel.dispatchEvent(new Event('change'));
+      }
+    }, 50);
+  });
+
+  document.querySelectorAll('[data-encerrar-fixo]').forEach(b => b.onclick = () => {
+    confirmAction(
+      'Encerrar recorrência?',
+      'A conta-mãe será desativada e não vai mais gerar novas ocorrências automáticas. As contas já criadas (passadas e futuras) permanecem. Use isso quando cancelar um serviço.',
+      async () => {
+        const id = b.dataset.encerrarFixo;
+        const c = state.contas.find(x => x.id === id);
+        if (!c) return;
+        // Marca como inativa essa e a conta-mãe (se existir)
+        const origemId = c.conta_origem_id || c.id;
+        const todasDoGrupo = state.contas.filter(x => x.id === origemId || x.conta_origem_id === origemId);
+        for (const conta of todasDoGrupo) {
+          conta.ativa = false;
+          await syncUpdate('contas', conta.id, { ativa: false });
+        }
+        toast('Recorrência encerrada — não gera mais ocorrências');
+        render();
+      }
+    );
+  });
+
+  document.querySelectorAll('[data-edit-conta]').forEach(b => b.onclick = () => {
+    const c = state.contas.find(x => x.id === b.dataset.editConta);
+    modalConta(c);
+  });
+  document.querySelectorAll('[data-del-conta]').forEach(b => b.onclick = () => {
+    confirmAction('Excluir conta?', 'Esta ação não pode ser desfeita.', async () => {
+      const id = b.dataset.delConta;
+      state.contas = state.contas.filter(c => c.id !== id);
+      await syncDelete('contas', id);
+      toast('Conta excluída');
+      render();
+    });
+  });
+
+  // Metas
+  document.querySelectorAll('[data-set-meta]').forEach(b => b.onclick = () => {
+    const [opId, mesAno] = b.dataset.setMeta.split('|');
+    modalMeta(opId, mesAno);
+  });
+  document.querySelectorAll('[data-edit-meta]').forEach(b => b.onclick = () => {
+    const [opId, mesAno] = b.dataset.editMeta.split('|');
+    const meta = getMeta(opId, mesAno);
+    modalMeta(opId, mesAno, meta);
+  });
+  document.querySelectorAll('[data-pagar-conta]').forEach(b => b.onclick = async () => {
+    const c = state.contas.find(x => x.id === b.dataset.pagarConta);
+    if (!c) return;
+
+    // Se a conta não tem carteira definida, pede pro usuário escolher
+    let carteiraId = c.carteira;
+    if (!carteiraId) {
+      const carteirasOp = carteirasDaOperacao(c.operacao);
+      if (carteirasOp.length === 0) {
+        toast('Crie uma carteira pra essa operação primeiro', 'error');
+        return;
+      }
+      if (carteirasOp.length === 1) {
+        carteiraId = carteirasOp[0].id;
+      } else {
+        // Modal rápido pra escolher carteira
+        openModal(`
+          <div class="modal-title">Pagar com qual carteira?</div>
+          <div class="modal-subtitle">${c.descricao} · ${fmt.brl(c.valor)}</div>
+          <div class="form-row" style="margin-top:14px;">
+            <label>Carteira</label>
+            <select id="m-w">
+              ${carteirasOp.map(w => `<option value="${w.id}">${w.nome} · ${fmt.brl(saldoCarteira(w.id))}</option>`).join('')}
+            </select>
+          </div>
+          <div class="modal-actions">
+            <button class="btn btn-ghost" onclick="closeModal()">Cancelar</button>
+            <button class="btn btn-primary" id="m-confirmar">Confirmar pagamento</button>
+          </div>
+        `, (modal) => {
+          modal.querySelector('#m-confirmar').onclick = async () => {
+            const escolhida = modal.querySelector('#m-w').value;
+            closeModal();
+            await pagarConta(c, escolhida);
+          };
+        });
+        return;
+      }
+    }
+
+    await pagarConta(c, carteiraId);
+  });
+
+  // Categorias
+  document.getElementById('btn-nova-cat')?.addEventListener('click', () => modalCategoria());
+  document.querySelectorAll('[data-edit-cat]').forEach(b => b.onclick = () => {
+    const c = state.categorias.find(x => x.id === b.dataset.editCat);
+    modalCategoria(c);
+  });
+  document.querySelectorAll('[data-del-cat]').forEach(b => b.onclick = () => {
+    const id = b.dataset.delCat;
+    const usos = state.transacoes.filter(t => t.categoria === id).length;
+    if (usos > 0) { toast(`Não pode excluir — ${usos} transação(ões) usam essa categoria`, 'error'); return; }
+    confirmAction('Excluir categoria?', 'Esta ação não pode ser desfeita.', async () => {
+      state.categorias = state.categorias.filter(c => c.id !== id);
+      await syncDelete('categorias', id);
+      toast('Categoria excluída');
+      render();
+    });
+  });
+
+  // Config
+  document.getElementById('btn-salvar-config')?.addEventListener('click', () => {
+    state.config.empresa = document.getElementById('cfg-empresa').value.trim() || 'Empresa';
+    state.config.operacoes.forEach(o => {
+      o.nome = document.querySelector(`[data-cfg-op-nome="${o.id}"]`).value.trim() || o.nome;
+      o.banco = document.querySelector(`[data-cfg-op-banco="${o.id}"]`).value.trim() || o.banco;
+    });
+    saveLocal();
+    // Atualiza toggle
+    document.querySelector('[data-view="op_a"]').textContent = state.config.operacoes[0].nome;
+    document.querySelector('[data-view="op_b"]').textContent = state.config.operacoes[1].nome;
+    toast('Configurações salvas', 'success');
+    render();
+  });
+
+  // Carteiras (na config)
+  document.querySelectorAll('[data-add-w]').forEach(b => b.onclick = () => modalCarteira(null, b.dataset.addW));
+  document.querySelectorAll('[data-edit-w]').forEach(b => b.onclick = () => {
+    const w = state.carteiras.find(x => x.id === b.dataset.editW);
+    modalCarteira(w);
+  });
+  document.querySelectorAll('[data-del-w]').forEach(b => b.onclick = () => {
+    const id = b.dataset.delW;
+    const usos = state.transacoes.filter(t => t.carteira === id || t.carteira_destino === id).length;
+    if (usos > 0) { toast(`Não pode excluir — ${usos} transação(ões) usam essa carteira`, 'error'); return; }
+    confirmAction('Excluir carteira?', 'Esta ação não pode ser desfeita.', async () => {
+      state.carteiras = state.carteiras.filter(w => w.id !== id);
+      await syncDelete('carteiras', id);
+      toast('Carteira excluída');
+      render();
+    });
+  });
+
+  // Backup
+  document.getElementById('btn-export')?.addEventListener('click', () => {
+    const data = {
+      meta: { app: 'Atomo Finance', exportedAt: new Date().toISOString(), version: 3 },
+      config: state.config,
+      categorias: state.categorias,
+      carteiras: state.carteiras,
+      transacoes: state.transacoes,
+      contas: state.contas,
+      metas: state.metas,
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `atomo-finance-${todayISO()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast('Backup exportado', 'success');
+  });
+  document.getElementById('btn-import')?.addEventListener('click', () => document.getElementById('file-import').click());
+  document.getElementById('file-import')?.addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      const data = JSON.parse(text);
+      // Merge — adiciona apenas IDs novos
+      const novosCats   = (data.categorias || []).filter(c => !state.categorias.find(x => x.id === c.id));
+      const novasWlts   = (data.carteiras  || []).filter(w => !state.carteiras.find(x => x.id === w.id));
+      const novosTxs    = (data.transacoes || []).filter(t => !state.transacoes.find(x => x.id === t.id));
+      const novasContas = (data.contas     || []).filter(c => !state.contas.find(x => x.id === c.id));
+      const novasMetas  = (data.metas      || []).filter(m => !state.metas.find(x => x.id === m.id));
+
+      state.categorias.push(...novosCats);
+      state.carteiras.push(...novasWlts);
+      state.transacoes.unshift(...novosTxs);
+      state.contas.push(...novasContas);
+      state.metas.push(...novasMetas);
+
+      if (state.online) {
+        if (novosCats.length)   await db.from('categorias').insert(novosCats);
+        if (novasWlts.length)   await db.from('carteiras').insert(novasWlts);
+        if (novosTxs.length)    await db.from('transacoes').insert(novosTxs);
+        if (novasContas.length) await db.from('contas').insert(novasContas);
+        if (novasMetas.length)  await db.from('metas').insert(novasMetas);
+      }
+      saveLocal();
+      toast(`Importado: +${novosCats.length} cat, +${novasWlts.length} carteiras, +${novosTxs.length} tx, +${novasContas.length} contas, +${novasMetas.length} metas`, 'success');
+      render();
+    } catch (err) {
+      console.error(err);
+      toast('JSON inválido', 'error');
+    }
+    e.target.value = '';
+  });
+
+  // Reset
+  document.getElementById('btn-reset')?.addEventListener('click', () => {
+    confirmAction('Resetar todos os dados?', 'Apaga transações, contas e categorias. Carteiras e configurações permanecem. Esta ação não pode ser desfeita.', async () => {
+      if (state.online) {
+        await Promise.all([
+          db.from('transacoes').delete().neq('id', ''),
+          db.from('contas').delete().neq('id', ''),
+          db.from('categorias').delete().neq('id', ''),
+        ]);
+      }
+      state.transacoes = [];
+      state.contas = [];
+      state.categorias = [];
+      saveLocal();
+      // Recria seed
+      state.categorias = [...SEED_CATEGORIAS];
+      if (state.online) await db.from('categorias').insert(SEED_CATEGORIAS);
+      toast('Dados resetados', 'success');
+      render();
+    });
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   BOOT
+   ═══════════════════════════════════════════════════════════════════════ */
+async function boot() {
+  loadLocal();
+
+  // Mês inicial do dashboard = mês atual
+  if (!state.dashboardMes) state.dashboardMes = mesAtual();
+
+  // Garante seed se nada local
+  if (state.categorias.length === 0) state.categorias = [...SEED_CATEGORIAS];
+  if (state.carteiras.length === 0) state.carteiras = [...SEED_CARTEIRAS];
+
+  // Tenta sync com Supabase
+  await loadFromSupabase();
+
+  // Atualiza textos do toggle com nomes configurados
+  document.querySelector('[data-view="op_a"]').textContent = state.config.operacoes[0].nome;
+  document.querySelector('[data-view="op_b"]').textContent = state.config.operacoes[1].nome;
+
+  document.getElementById('splash').classList.add('hidden');
+  setTimeout(() => document.getElementById('splash').remove(), 400);
+
+  render();
+}
+
+boot();
+</script>
+
+</body>
+</html>
